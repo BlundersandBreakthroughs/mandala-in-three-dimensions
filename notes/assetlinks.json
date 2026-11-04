@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "TODO_REPLACE_WITH_ANDROID_PACKAGE_NAME (e.g. io.github.username.mandala)",
+      "sha256_cert_fingerprints": [
+        "TODO_REPLACE_WITH_SIGNING_KEY_SHA256_FINGERPRINT (32 colon-separated hex bytes, e.g. AB:CD:...; get it with: keytool -list -v -keystore your.keystore)"
+      ]
+    }
+  }
+]

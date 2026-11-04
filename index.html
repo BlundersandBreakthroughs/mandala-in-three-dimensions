@@ -1,0 +1,911 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mandala Madness 3D</title>
+<meta name="theme-color" content="#160c1f" />
+<meta name="description" content="Four hand-drawn mandalas, rebuilt in code as layered 3D you can pull apart in VR and MR." />
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png" />
+<link rel="apple-touch-icon" href="icons/icon-192.png" />
+<style>
+  :root { --bg: #160c1f; --fg: #f4ecff; --btn: #3a2353; --btnOn: #8c45ad; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #ui { position: fixed; left: 0; right: 0; bottom: 18px; display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; padding: 0 16px; pointer-events: none; }
+  #ui button { pointer-events: auto; border: 1px solid #ffffff33; background: var(--btn); color: var(--fg); padding: 10px 14px; border-radius: 10px; font-size: 14px; cursor: pointer; }
+  #ui button.on { background: var(--btnOn); }
+  #ui button:disabled { opacity: .45; cursor: not-allowed; }
+  #ui .sep { width: 16px; }
+  #exl { pointer-events: auto; display: flex; align-items: center; gap: 8px; font-size: 14px; background: var(--btn); border: 1px solid #ffffff33; border-radius: 10px; padding: 6px 12px; }
+  #exl input { width: 140px; accent-color: var(--btnOn); }
+  #hint { position: fixed; top: 12px; left: 0; right: 0; text-align: center; font-size: 13px; opacity: .7; pointer-events: none; padding: 0 16px; }
+  body.shot #ui, body.shot #hint { display: none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "./vendor/three/build/three.module.js",
+  "three/addons/": "./vendor/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hint">Drag a ring to pull it out · Shift-drag or right-drag a ring to spin it · drag empty space to orbit · Explode slider spreads the layers · 1–4 switch · in VR: pinch/trigger a ring to pull it, twist your wrist (or use the stick) to spin it, B/Y resets spins, grip or pinch away from it to move the whole mandala, two hands to scale and push/pull to explode</div>
+<div id="ui">
+  <button data-m="0">Purple</button><button data-m="1">Crimson</button><button data-m="2">Emerald</button><button data-m="3">Saffron</button>
+  <span class="sep"></span>
+  <button id="reset">Reset rings</button>
+  <label id="exl">Explode <input id="explode" type="range" min="0" max="1" step="0.01" value="0" /></label>
+  <span class="sep"></span>
+  <button id="vr" disabled>Enter VR</button><button id="mr" disabled>Enter MR</button>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
+
+const params = new URLSearchParams(location.search);
+const SHOT = params.has('shot');
+const TAU = Math.PI * 2;
+const WORLD_R = 0.42; // mandala radius in metres
+
+// ───────────────────────── drawing engine ─────────────────────────
+// Everything is drawn into one merged, non-indexed BufferGeometry per mandala
+// (one draw call). Units: R = 1 is the mandala's outer radius. z is relief height.
+
+const mulberry32 = (a) => () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+const L = (lvl) => lvl * 0.003;   // layer height
+const INK_Z = 0.0007;              // ink sits just above its fill
+const pol = (r, a) => [r * Math.sin(a), r * Math.cos(a)]; // a = 0 points up, clockwise
+const _col = new THREE.Color();
+const _v2 = [];
+
+class Builder {
+  constructor(seed) { this.pos = []; this.col = []; this.rng = mulberry32(seed); this.setRot(0); this.noVary(); this.inkW = 0.006; this.zo = 0; this.marks = [{ name: 'base', at: 0 }]; }
+  /** Starts a new ring: everything drawn after this becomes its own mesh you can pull out. */
+  ring(name) { this.marks.push({ name, at: this.pos.length }); }
+  setRot(a) { this.c = Math.cos(a); this.s = Math.sin(a); }
+  vary(amt = 1) { const r = this.rng; this.dh = (r() - .5) * 0.022 * amt; this.ds = (r() - .5) * 0.10 * amt; this.dl = (r() - .5) * 0.05 * amt; }
+  noVary() { this.dh = this.ds = this.dl = 0; }
+  color(hex) { _col.setHex(hex); if (this.dh || this.ds || this.dl) _col.offsetHSL(this.dh, this.ds, this.dl); return [_col.r, _col.g, _col.b]; }
+  v(x, y, z, c) { this.pos.push(x * this.c - y * this.s, x * this.s + y * this.c, z + this.zo); this.col.push(c[0], c[1], c[2]); }
+
+  /**
+   * Repeat a motif n times around the centre, with per-copy hand-made colour variation.
+   * Alternate copies are lifted by zAlt so neighbours that overlap never z-fight (n is always even).
+   */
+  repeat(n, fn, phase = 0, vary = 1, zAlt = 0.0003) {
+    for (let k = 0; k < n; k++) { const a = (k + phase) * TAU / n; this.setRot(-a); this.vary(vary); this.zo = (k % 2) * zAlt; fn(k, a); }
+    this.setRot(0); this.noVary(); this.zo = 0;
+  }
+
+  fill(pts, hex, z) {
+    const c = this.color(hex);
+    _v2.length = 0; for (const p of pts) _v2.push(new THREE.Vector2(p[0], p[1]));
+    const tris = THREE.ShapeUtils.triangulateShape(_v2, []);
+    for (const t of tris) for (const i of t) this.v(pts[i][0], pts[i][1], z, c);
+  }
+  /** Constant-width ribbon along a polyline. z may be a number or an array (one per point). */
+  line(pts, w, hex, z, closed = false) {
+    const c = this.color(hex), n = pts.length; if (n < 2) return;
+    const h = w / 2, Lp = [], Rp = [];
+    for (let i = 0; i < n; i++) {
+      const p = pts[i];
+      const a = closed ? pts[(i - 1 + n) % n] : pts[Math.max(0, i - 1)];
+      const b = closed ? pts[(i + 1) % n] : pts[Math.min(n - 1, i + 1)];
+      let n1x = 0, n1y = 0, n2x = 0, n2y = 0;
+      if (a !== p) { const dx = p[0] - a[0], dy = p[1] - a[1], l = Math.hypot(dx, dy) || 1; n1x = -dy / l; n1y = dx / l; }
+      if (b !== p) { const dx = b[0] - p[0], dy = b[1] - p[1], l = Math.hypot(dx, dy) || 1; n2x = -dy / l; n2y = dx / l; }
+      if (a === p) { n1x = n2x; n1y = n2y; } if (b === p) { n2x = n1x; n2y = n1y; }
+      let mx = n1x + n2x, my = n1y + n2y; const ml = Math.hypot(mx, my) || 1; mx /= ml; my /= ml;
+      const d = Math.max(0.35, mx * n1x + my * n1y); const s = h / d;
+      Lp.push([p[0] + mx * s, p[1] + my * s]); Rp.push([p[0] - mx * s, p[1] - my * s]);
+    }
+    const zi = (i) => (typeof z === 'number' ? z : z[i]);
+    const segs = closed ? n : n - 1;
+    for (let i = 0; i < segs; i++) {
+      const j = (i + 1) % n, za = zi(i), zb = zi(j);
+      this.v(Lp[i][0], Lp[i][1], za, c); this.v(Rp[i][0], Rp[i][1], za, c); this.v(Lp[j][0], Lp[j][1], zb, c);
+      this.v(Rp[i][0], Rp[i][1], za, c); this.v(Rp[j][0], Rp[j][1], zb, c); this.v(Lp[j][0], Lp[j][1], zb, c);
+    }
+    if (!closed && w > 0.004) { this.circle(pts[0][0], pts[0][1], h, hex, zi(0)); this.circle(pts[n - 1][0], pts[n - 1][1], h, hex, zi(n - 1)); }
+  }
+  circle(cx, cy, r, hex, z, seg) {
+    const c = this.color(hex); seg = seg || Math.max(8, Math.min(220, Math.ceil(r * 520)));
+    for (let i = 0; i < seg; i++) {
+      const a0 = i / seg * TAU, a1 = (i + 1) / seg * TAU;
+      this.v(cx, cy, z, c); this.v(cx + r * Math.sin(a0), cy + r * Math.cos(a0), z, c); this.v(cx + r * Math.sin(a1), cy + r * Math.cos(a1), z, c);
+    }
+  }
+  /** Filled shape with a marker-ink outline. */
+  shape(pts, hex, z, ink = INK, w = this.inkW) { this.fill(pts, hex, z); if (w > 0) this.line(pts, w, ink, z + INK_Z, true); }
+  dot(x, y, r, hex, z) { this.circle(x, y, r, hex, z); }
+
+  // ── full-ring helpers (drawn once, unrotated) ──
+  ringFill(f, hex, z, n, inner = null) {
+    const N = samples(n), c = this.color(hex);
+    for (let i = 0; i < N; i++) {
+      const t0 = i / N * TAU, t1 = (i + 1) / N * TAU;
+      const [ax, ay] = pol(f(t0), t0), [bx, by] = pol(f(t1), t1);
+      if (!inner) { this.v(0, 0, z, c); this.v(ax, ay, z, c); this.v(bx, by, z, c); }
+      else {
+        const [cx, cy] = pol(inner(t0), t0), [dx, dy] = pol(inner(t1), t1);
+        this.v(cx, cy, z, c); this.v(ax, ay, z, c); this.v(bx, by, z, c);
+        this.v(cx, cy, z, c); this.v(bx, by, z, c); this.v(dx, dy, z, c);
+      }
+    }
+  }
+  ringLine(f, w, hex, z, n) { const N = samples(n), pts = []; for (let i = 0; i < N; i++) { const t = i / N * TAU; pts.push(pol(f(t), t)); } this.line(pts, w, hex, z, true); }
+  /** Filled star/rosette region with an ink outline. */
+  rosette(f, hex, z, n, ink = INK, w = this.inkW) { this.ringFill(f, hex, z, n); if (w > 0) this.ringLine(f, w, ink, z + INK_Z, n); }
+  /** Dots spaced evenly along a polar curve. */
+  dotsAlong(f, count, r, hex, z, phase = 0.5) {
+    // arc-length spacing
+    const N = 2048, cum = [0]; let prev = pol(f(0), 0);
+    for (let i = 1; i <= N; i++) { const t = i / N * TAU, p = pol(f(t), t); cum.push(cum[i - 1] + Math.hypot(p[0] - prev[0], p[1] - prev[1])); prev = p; }
+    const total = cum[N]; let j = 0;
+    for (let k = 0; k < count; k++) {
+      const target = (k + phase) / count * total; while (cum[j + 1] < target) j++;
+      const t = (j + (target - cum[j]) / (cum[j + 1] - cum[j])) / N * TAU; const [x, y] = pol(f(t), t);
+      this.vary(0.6); this.dot(x, y, r, hex, z);
+    }
+    this.noVary();
+  }
+
+  /**
+   * Interlaced bands: circles cross alternately over and under, like a real weave.
+   * Each item: { x, y, r, w, hex, stripe? } in mandala space.
+   */
+  weave(circles, z, amp = 0.004, inkW = this.inkW) {
+    const cross = []; // {i,j,ai,aj}
+    for (let i = 0; i < circles.length; i++) for (let j = i + 1; j < circles.length; j++) {
+      const A = circles[i], Bc = circles[j]; const dx = Bc.x - A.x, dy = Bc.y - A.y, d = Math.hypot(dx, dy);
+      if (d >= A.r + Bc.r || d <= Math.abs(A.r - Bc.r)) continue;
+      const a = (A.r * A.r - Bc.r * Bc.r + d * d) / (2 * d), h = Math.sqrt(Math.max(0, A.r * A.r - a * a));
+      const mx = A.x + a * dx / d, my = A.y + a * dy / d;
+      for (const s of [1, -1]) {
+        const px = mx + s * h * (-dy / d), py = my + s * h * (dx / d);
+        cross.push({ i, j, ai: Math.atan2(px - A.x, py - A.y), aj: Math.atan2(px - Bc.x, py - Bc.y), over: null });
+      }
+    }
+    const per = circles.map(() => []);
+    cross.forEach((x, id) => { per[x.i].push({ id, a: x.ai, mine: true }); per[x.j].push({ id, a: x.aj, mine: false }); });
+    per.forEach((l) => l.sort((p, q) => p.a - q.a));
+    // alternate along every circle: BFS 2-colouring of crossings
+    const adj = cross.map(() => []);
+    per.forEach((l) => { for (let k = 0; k < l.length; k++) { const p = l[k], q = l[(k + 1) % l.length]; if (p === q) continue; adj[p.id].push({ to: q.id, same: p.mine === q.mine }); adj[q.id].push({ to: p.id, same: p.mine === q.mine }); } });
+    for (let s = 0; s < cross.length; s++) {
+      if (cross[s].over !== null) continue; cross[s].over = true; const queue = [s];
+      while (queue.length) { const u = queue.shift(); for (const e of adj[u]) { const want = e.same ? !cross[u].over : cross[u].over; if (cross[e.to].over === null) { cross[e.to].over = want; queue.push(e.to); } } }
+    }
+    circles.forEach((C, ci) => {
+      const l = per[ci].map((p) => ({ a: p.a, s: (cross[p.id].over === p.mine) ? 1 : -1 }));
+      const N = Math.max(96, Math.ceil(C.r * 900)), pts = [], zs = [];
+      for (let k = 0; k < N; k++) {
+        const a = -Math.PI + k / N * TAU; let zz = 0;
+        if (l.length) {
+          let n1 = l.findIndex((p) => p.a > a); if (n1 < 0) n1 = 0; const p0 = l[(n1 - 1 + l.length) % l.length], p1 = l[n1];
+          let span = p1.a - p0.a; if (span <= 0) span += TAU; let f = a - p0.a; if (f < 0) f += TAU; const t = f / span;
+          const e = t * t * (3 - 2 * t); zz = amp * (p0.s * (1 - e) + p1.s * e);
+        }
+        pts.push([C.x + C.r * Math.sin(a), C.y + C.r * Math.cos(a)]); zs.push(z + zz);
+      }
+      this.vary(0.8);
+      this.line(pts, C.w + inkW * 2, C.ink ?? INK, zs.map((q) => q - INK_Z), true);
+      this.line(pts, C.w, C.hex, zs, true);
+      if (C.stripe) this.line(pts, C.w * 0.28, C.stripe, zs.map((q) => q + INK_Z * 0.6), true);
+      this.noVary();
+    });
+  }
+
+  build() {
+    // hand-drawn wobble: a smooth, non-symmetric displacement field, so every copy differs a little
+    const p = this.pos, rnd = mulberry32(99), ph = [rnd() * 9, rnd() * 9, rnd() * 9, rnd() * 9], amp = 0.0022;
+    for (let i = 0; i < p.length; i += 3) {
+      const x = p[i], y = p[i + 1];
+      p[i] += amp * (Math.sin(7.3 * y + ph[0]) + 0.6 * Math.sin(17.1 * y + 11.3 * x + ph[1]));
+      p[i + 1] += amp * (Math.sin(6.7 * x + ph[2]) + 0.6 * Math.sin(15.7 * x - 12.9 * y + ph[3]));
+    }
+    // one geometry per ring, with its radial extent and mid height (used to pick rings by hand)
+    const parts = [];
+    this.marks.forEach((mk, k) => {
+      const from = mk.at, to = k + 1 < this.marks.length ? this.marks[k + 1].at : p.length;
+      if (to <= from) return;
+      const pos = new Float32Array(p.slice(from, to)), col = new Float32Array(this.col.slice(from, to)), nrm = new Float32Array(to - from);
+      let rMin = Infinity, rMax = 0, zMin = Infinity, zMax = -Infinity;
+      for (let i = 0; i < pos.length; i += 3) { const r = Math.hypot(pos[i], pos[i + 1]); rMin = Math.min(rMin, r); rMax = Math.max(rMax, r); zMin = Math.min(zMin, pos[i + 2]); zMax = Math.max(zMax, pos[i + 2]); nrm[i + 2] = 1; }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+      g.computeBoundingSphere();
+      parts.push({ name: mk.name, geometry: g, rMin, rMax, zMid: (zMin + zMax) / 2 });
+    });
+    this.pos = this.col = null;
+    return parts;
+  }
+}
+let INK = 0x1c1424;
+const samples = (n) => 2 * n * Math.ceil(900 / (2 * n));
+
+// polar profiles: tips at θ = (k + phase)·2π/n
+const prof = (n, rb, rt, kind = 'petal', phase = 0) => (th) => {
+  let u = (th / TAU) * n - phase + 0.5; u -= Math.floor(u);
+  const t = 1 - Math.abs(2 * u - 1); let g;
+  switch (kind) {
+    case 'zig': g = t; break;
+    case 'petal': g = Math.pow(t, 0.55); break;
+    case 'round': g = Math.sqrt(1 - (1 - t) * (1 - t)); break;
+    case 'blunt': g = Math.pow(Math.sin(t * Math.PI / 2), 0.45); break;
+    case 'concave': g = t * t; break;
+    default: g = t;
+  }
+  return rb + (rt - rb) * g;
+};
+const circ = (r) => () => r;
+
+// local motif shapes (+y outward)
+/** Symmetric leaf from r0 (base) to r1 (tip), half-width w. a/b: base/tip roundness (<1 round, 1 pointed). */
+const lens = (r0, r1, w, a = 1, b = 1, N = 40) => {
+  const right = [], left = []; let max = 0; const raw = [];
+  for (let i = 0; i <= N; i++) { const s = i / N; const x = Math.pow(s, a) * Math.pow(1 - s, b); raw.push(x); max = Math.max(max, x); }
+  for (let i = 0; i <= N; i++) { const s = i / N, y = r0 + (r1 - r0) * s, x = w * raw[i] / max; right.push([x, y]); if (i > 0 && i < N) left.push([-x, y]); }
+  return right.concat(left.reverse());
+};
+const scale = (pts, k, cx = 0, cy = null) => { if (cy === null) { cy = pts.reduce((s, p) => s + p[1], 0) / pts.length; } return pts.map(([x, y]) => [cx + (x - cx) * k, cy + (y - cy) * k]); };
+const scaleXY = (pts, kx, ky, cx, cy) => pts.map(([x, y]) => [cx + (x - cx) * kx, cy + (y - cy) * ky]);
+const arcPts = (cx, cy, r, a0, a1, N) => { N = N || Math.max(12, Math.ceil(Math.abs(a1 - a0) * r * 160)); const o = []; for (let i = 0; i <= N; i++) { const a = a0 + (a1 - a0) * i / N; o.push([cx + r * Math.sin(a), cy + r * Math.cos(a)]); } return o; };
+const rhombus = (cy, hl, hw, cx = 0) => [[cx, cy - hl], [cx + hw, cy], [cx, cy + hl], [cx - hw, cy]];
+/** Keeps only the parts of a polyline inside a region; returns pieces. */
+const clip = (pts, inside) => { const out = []; let cur = []; for (const p of pts) { if (inside(p[0], p[1])) cur.push(p); else { if (cur.length > 1) out.push(cur); cur = []; } } if (cur.length > 1) out.push(cur); return out; };
+const spiral = (cx, cy, r, turns = 1.6, N = 26) => { const o = []; for (let i = 0; i <= N; i++) { const t = i / N, a = t * turns * TAU; o.push([cx + r * t * Math.sin(a), cy + r * t * Math.cos(a)]); } return o; };
+
+// ───────────────────────── the four mandalas ─────────────────────────
+
+const DESIGNS = [];
+
+// 1 ─ Purple / blue: diamonds, interlaced arcs, netted fans, nested stars, salmon flower
+DESIGNS.push({ name: 'Purple', bg: 0x1a1030, build(b) {
+  INK = 0x2a1238;
+  const P = { paper: 0xfbf8f4, blue: 0x22409c, blueD: 0x172e78, purple: 0x6b2a8e, violet: 0x8a43ab, mauve: 0x9d5a7d, rose: 0xbb7c98, maroon: 0x7b3653, lav: 0xb9a3e0, lilac: 0xdccdf2, pink: 0xeca8d1, peach: 0xf7c8ad, salmon: 0xf4b394, stripe: 0x8c4458 };
+  const n = 12, A = TAU / n;
+  b.ring('paper backing');
+  b.ringFill(circ(0.905), P.paper, L(0), 24);
+
+  b.ring('blue diamonds');
+  // outer blue diamonds sitting on the arc crossings
+  b.repeat(24, () => {
+    const d = rhombus(0.925, 0.075, 0.05);
+    b.shape(d, P.blue, L(2.2), INK, 0.007);
+    b.shape(scale(d, 0.52, 0, 0.925), P.paper, L(2.5), INK, 0.004);
+    b.dot(0, 0.925, 0.011, INK, L(2.8));
+  }, 0.5);
+
+  b.ring('woven arcs');
+  // interlaced arcs: 24 circles, alternating rose and blue
+  const circles = [];
+  for (let k = 0; k < 24; k++) { const [x, y] = pol(0.605, k * TAU / 24); circles.push({ x, y, r: 0.285, w: k % 2 ? 0.024 : 0.036, hex: k % 2 ? P.blue : P.rose, stripe: k % 2 ? null : P.violet }); }
+  b.weave(circles, L(4), 0.0045, 0.005);
+
+  b.ring('netted fans');
+  // netted fans between the star tips
+  b.repeat(n, () => {
+    const cy = 0.6, R = 0.19;
+    b.circle(0, cy, R + 0.004, INK, L(6));
+    b.circle(0, cy, R - 0.002, P.rose, L(6.1));
+    b.circle(0, cy, R - 0.03, 0xf4e6ec, L(6.2));
+    // tick marks on the rim
+    for (let i = -16; i <= 16; i++) { const a = i / 16 * 1.75; b.line([[ (R - 0.03) * Math.sin(a), cy + (R - 0.03) * Math.cos(a)], [(R - 0.004) * Math.sin(a), cy + (R - 0.004) * Math.cos(a)]], 0.0035, P.maroon, L(6.3)); }
+    b.line(arcPts(0, cy, R - 0.03, -1.9, 1.9), 0.005, INK, L(6.3));
+    // fish-scale netting, clipped to the fan
+    const inR = R - 0.036, h = 0.021;
+    for (let row = 0; row < 14; row++) {
+      const y = cy + 0.175 - row * h * 0.95, off = row % 2 ? h : 0;
+      for (let x = -0.24 - off; x <= 0.24; x += 2 * h) {
+        for (const piece of clip(arcPts(x, y, h, -Math.PI / 2, Math.PI / 2, 14), (px, py) => Math.hypot(px, py - cy) < inR)) b.line(piece, 0.0055, P.maroon, L(6.4));
+      }
+    }
+  }, 0.5);
+
+  b.ring('blue petals');
+  // nested blue petals between the fans
+  b.repeat(n, () => {
+    const o = lens(0.5, 0.7, 0.075, 0.9, 1.05);
+    b.shape(o, P.blue, L(7.5), INK, 0.007);
+    b.shape(scale(o, 0.74, 0, 0.62), P.lav, L(7.7), INK, 0.004);
+    const w = scale(o, 0.5, 0, 0.625); b.shape(w, P.paper, L(7.9), INK, 0.004);
+    for (let i = -6; i <= 6; i++) for (const piece of clip([[i * 0.01 - 0.05, 0.56], [i * 0.01 + 0.05, 0.69]], (x, y) => Math.abs(x) < 0.034 * (1 - Math.abs(y - 0.625) / 0.065))) b.line(piece, 0.002, P.violet, L(8));
+    b.dot(0, 0.655, 0.009, P.purple, L(8.2));
+  });
+
+  b.ring('big star');
+  // big nested star: purple → peach with dots → blue
+  b.rosette(prof(n, 0.455, 0.615, 'petal'), P.purple, L(9), n, INK, 0.007);
+  b.rosette(prof(n, 0.432, 0.572, 'petal'), P.peach, L(9.3), n, INK, 0.004);
+  b.dotsAlong(prof(n, 0.418, 0.548, 'petal'), n * 11, 0.0065, INK, L(9.45));
+  b.rosette(prof(n, 0.4, 0.528, 'petal'), P.blue, L(9.6), n, INK, 0.006);
+  b.ringLine(prof(n, 0.382, 0.5, 'petal'), 0.006, P.blueD, L(9.75), n);
+  b.ring('pink star');
+  // pink star with big purple dots
+  b.rosette(prof(n, 0.335, 0.47, 'petal'), P.pink, L(10), n, INK, 0.004);
+  b.dotsAlong(prof(n, 0.335, 0.435, 'petal'), n * 6, 0.016, P.purple, L(10.2));
+  // lilac spiral band
+  b.rosette(prof(n, 0.3, 0.405, 'petal'), P.lilac, L(10.5), n, P.purple, 0.004);
+  {
+    const f = prof(n, 0.3, 0.38, 'petal');
+    for (let k = 0; k < n * 9; k++) { const t = (k + 0.5) / (n * 9) * TAU; const [x, y] = pol(f(t) - 0.01, t); b.vary(0.5); b.line(spiral(x, y, 0.011, 1.7), 0.0028, P.violet, L(10.7)); }
+    b.noVary();
+  }
+  b.rosette(prof(n, 0.275, 0.355, 'petal'), P.pink, L(11), n, INK, 0.004);
+  b.ring('striped petals');
+  // dark valleys + striped maroon petals
+  b.rosette(prof(n, 0.17, 0.27, 'zig', 0.5), 0x4a2236, L(11.3), n, INK, 0);
+  b.repeat(n, () => {
+    const p = lens(0.16, 0.305, 0.05, 0.55, 1.1);
+    b.shape(p, P.stripe, L(11.6), INK, 0.005);
+    for (let i = -4; i <= 4; i++) b.line([[i * 0.0035, 0.175], [i * 0.0105, 0.295]], 0.0022, INK, L(11.7));
+  }, 0.5);
+  b.ring('centre flower');
+  // blue star + salmon flower + purple heart
+  b.rosette(prof(n, 0.105, 0.195, 'petal'), P.blue, L(12), n, INK, 0.006);
+  b.ringLine(prof(n, 0.09, 0.17, 'petal'), 0.005, P.blueD, L(12.2), n);
+  b.repeat(n, () => {
+    const p = lens(0.045, 0.14, 0.032, 0.85, 1);
+    b.shape(p, P.salmon, L(12.5), INK, 0.005);
+    b.shape(lens(0.075, 0.118, 0.012, 1, 1), 0x5a2a3a, L(12.7), INK, 0);
+  });
+  b.circle(0, 0, 0.055, P.purple, L(13));
+  b.circle(0, 0, 0.03, P.violet, L(13.2));
+  for (let k = 0; k < 10; k++) { const [x, y] = pol(0.042, k / 10 * TAU); b.dot(x, y, 0.004, INK, L(13.3)); }
+} });
+
+// 2 ─ Crimson / teal / black: lace rim, teal petals, chained crimson eyes, rainbow arches, zig-zag stars
+DESIGNS.push({ name: 'Crimson', bg: 0x14141c, build(b) {
+  INK = 0x121216;
+  const P = { paper: 0xf7f4f2, black: 0x19171d, red: 0x9c1f2f, redD: 0x701521, teal: 0x5e8487, tealL: 0x8aaaab, pink: 0xe9a8c0, pinkL: 0xf4cad9, white: 0xf6f4f1 };
+  const n = 16, m = 16;
+  b.ring('lace backing');
+  b.ringFill(circ(0.9), P.paper, L(0), n);
+  b.ringFill(circ(0.82), P.black, L(0.3), n);
+  // lace scallops with little teeth
+  b.ringLine((t) => prof(n, 0.88, 0.975, 'round', 0.5)(t) + 0.008 * Math.abs(Math.sin(t * n * 4.5)), 0.015, P.black, L(0.6), n * 9);
+  b.ringLine(prof(n, 0.86, 0.945, 'round', 0.5), 0.007, P.black, L(0.6), n);
+  b.ring('teal petals');
+  // teal outer petals
+  b.repeat(n, () => {
+    const p = lens(0.55, 0.97, 0.115, 0.75, 1.05);
+    b.shape(p, P.teal, L(2), INK, 0.016);
+    const q = scale(p, 0.84, 0, 0.77);
+    for (let i = 3; i < q.length; i += 3) b.dot(q[i][0], q[i][1], 0.0042, P.black, L(2.2));
+    b.shape(lens(0.875, 0.93, 0.016, 0.6, 1), P.pink, L(2.3), INK, 0.003);
+  });
+  b.ring('rainbow arches');
+  // rainbow arches (open U bands) over the petal bases
+  b.repeat(n, () => {
+    const cols = [P.teal, P.white, P.pink, P.white, P.black];
+    cols.forEach((c, i) => {
+      const rx = 0.13 - i * 0.021, ry = rx * 1.75, pts = [];
+      for (let k = 0; k <= 40; k++) { const a = -Math.PI * 0.5 + k / 40 * Math.PI; pts.push([rx * Math.sin(a), 0.43 + ry * Math.cos(a)]); }
+      b.line(pts, 0.023, INK, L(3 + i * 0.1) - INK_Z); b.line(pts, 0.017, c, L(3 + i * 0.1));
+    });
+    b.shape(lens(0.43, 0.49, 0.03, 0.5, 0.6), P.red, L(3.6), INK, 0.004);
+  });
+  b.ring('crimson eyes');
+  // chained crimson eyes, each tilted so neighbours interlock
+  const tilt = (pts) => { const a = 0.42, c = Math.cos(a), sn = Math.sin(a), oy = 0.69; return pts.map(([x, y]) => [x * c - (y - oy) * sn, oy + x * sn + (y - oy) * c]); };
+  b.repeat(n, () => {
+    const o = lens(0.47, 0.92, 0.15, 0.85, 1.1);
+    b.shape(tilt(o), P.black, L(4), INK, 0.004);
+    b.shape(tilt(scale(o, 0.8, 0, 0.69)), P.red, L(4.2), INK, 0.003);
+    b.shape(tilt(scale(o, 0.5, 0, 0.7)), P.black, L(4.4), INK, 0);
+    const v = [[-0.045, 0.665], [0, 0.765], [0.045, 0.665], [0.026, 0.66], [0, 0.72], [-0.026, 0.66]];
+    b.shape(tilt(v), P.teal, L(4.6), INK, 0.003);
+    b.shape(tilt([[-0.015, 0.67], [0, 0.7], [0.015, 0.67]]), P.tealL, L(4.7), INK, 0);
+  }, 0.5, 1, L(0.8));
+  b.ring('zig-zag ring');
+  // teal / white zig-zag ring
+  b.rosette(prof(m, 0.36, 0.47, 'zig', 0.5), P.teal, L(5.6), m, INK, 0.008);
+  b.rosette(prof(m, 0.34, 0.445, 'zig', 0.5), P.white, L(5.8), m, INK, 0.004);
+  b.rosette(prof(m, 0.32, 0.42, 'zig', 0.5), P.black, L(6), m, INK, 0);
+  b.ring('stepped star');
+  // red / black stepped star with pink hatched triangles
+  b.rosette(prof(m, 0.28, 0.41, 'zig'), P.red, L(6.2), m, INK, 0.006);
+  b.rosette(prof(m, 0.262, 0.372, 'zig'), P.black, L(6.4), m, INK, 0);
+  b.repeat(m, () => {
+    const tri = [[-0.028, 0.33], [0.028, 0.33], [0, 0.368]];
+    b.shape(tri, P.pinkL, L(6.6), P.red, 0.004);
+    for (let i = 1; i < 5; i++) b.line([[-0.028 + i * 0.0112, 0.331], [-0.019 + i * 0.0076, 0.362]], 0.0018, P.red, L(6.7));
+  }, 0.5);
+  b.rosette(prof(m, 0.245, 0.33, 'zig', 0.5), P.red, L(6.8), m, INK, 0.006);
+  b.rosette(prof(m, 0.23, 0.3, 'zig', 0.5), P.black, L(7), m, INK, 0);
+  b.circle(0, 0, 0.245, P.black, L(7.1));
+  b.ring('teal eyes');
+  // teal eye petals
+  b.repeat(m, () => {
+    const p = lens(0.15, 0.24, 0.042, 0.7, 0.8);
+    b.shape(p, P.teal, L(7.6), INK, 0.004);
+    b.shape(lens(0.175, 0.217, 0.018, 1, 1), P.white, L(7.8), INK, 0.003);
+    b.dot(0, 0.196, 0.0075, P.black, L(7.9));
+  });
+  b.repeat(m, () => { b.dot(0, 0.16, 0.008, P.white, L(7.7)); }, 0.5);
+  b.ring('red petals');
+  // red petals with white dots
+  b.repeat(m, () => {
+    const p = lens(0.07, 0.15, 0.03, 0.6, 1);
+    b.shape(p, P.red, L(8.1), INK, 0.004);
+    b.dot(0, 0.113, 0.0065, P.white, L(8.3));
+  }, 0.5);
+  b.ring('rosette');
+  // crimson rosette with white rays
+  b.circle(0, 0, 0.075, P.red, L(8.6));
+  b.repeat(m, () => { b.shape(lens(0.022, 0.068, 0.006, 1, 1), P.white, L(8.8), INK, 0.002); });
+  b.circle(0, 0, 0.022, P.black, L(9));
+} });
+
+// 3 ─ Emerald / gold / maroon: spikes with teardrops, stepped diamond bands, woven ring, arches, daisy
+DESIGNS.push({ name: 'Emerald', bg: 0x0f1a14, build(b) {
+  INK = 0x1c1210;
+  const P = { paper: 0xfbf8f2, maroon: 0x6f1f2b, maroonL: 0x8c2d3a, green: 0x1f4f36, greenL: 0x2b6446, greenD: 0x15382a, gold: 0xa9954a, goldL: 0xc7b465, white: 0xf8f6f1, hatch: 0x8f9ac4, black: 0x16120f };
+  const n = 12;
+  const BASE = 0.69, HW = 0.14;
+  b.ring('diamond bands');
+  // stepped diamond bands along each spike edge
+  b.repeat(n, () => {
+    for (const side of [-1, 1]) {
+      const ax = side * HW, ay = BASE, bx = 0, by = 1.0, len = Math.hypot(bx - ax, by - ay);
+      const tx = (bx - ax) / len, ty = (by - ay) / len, nx = side * ty, ny = -side * tx; // outward normal
+      const P0 = (t, o) => [ax + (bx - ax) * t + nx * o, ay + (by - ay) * t + ny * o];
+      const band = (o, t0, t1) => [P0(t0, o), P0(t1, o)];
+      // pale hatched teeth outside
+      for (let i = 0; i < 4; i++) { const t = 0.12 + i * 0.2; const c = P0(t, 0.082); b.line([P0(t - 0.06, 0.066), c, P0(t + 0.06, 0.066)], 0.0022, P.hatch, L(0.8)); }
+      b.line(band(0.062, 0.02, 0.86), 0.016, INK, L(1) - INK_Z); b.line(band(0.062, 0.02, 0.86), 0.011, P.maroon, L(1));
+      for (let i = 0; i < 4; i++) {
+        const t = 0.12 + i * 0.2, [cx, cy] = P0(t, 0.034), s = 0.024;
+        const sq = [[cx + tx * s, cy + ty * s], [cx + nx * s, cy + ny * s], [cx - tx * s, cy - ty * s], [cx - nx * s, cy - ny * s]];
+        b.shape(sq, P.white, L(1.2), P.maroon, 0.008);
+        b.dot(cx, cy, 0.0075, P.black, L(1.4));
+      }
+    }
+  });
+  b.ring('spikes');
+  // spikes with teardrops and gold hatch
+  b.repeat(n, () => {
+    const sp = [[0, 1.0], [HW, BASE], [0, BASE - 0.04], [-HW, BASE]];
+    b.shape(sp, P.maroon, L(2), INK, 0.006);
+    const inner = scale(sp, 0.8, 0, 0.78);
+    b.shape(inner, P.green, L(2.2), INK, 0.004);
+    for (let i = 0; i < 10; i++) { const y = 0.885 + i * 0.009; for (const piece of clip([[-0.07, y - 0.035], [0.07, y + 0.035]], (x, yy) => Math.abs(x) < (0.975 - yy) * 0.5)) b.line(piece, 0.0022, P.goldL, L(2.3)); }
+    const t = lens(0.7, 0.9, 0.068, 0.5, 1.25);
+    b.shape(t, P.maroonL, L(2.5), INK, 0.004);
+    b.shape(scale(t, 0.76, 0, 0.78), P.gold, L(2.7), INK, 0.003);
+    b.shape(scale(t, 0.5, 0, 0.78), P.green, L(2.9), INK, 0.003);
+    b.shape(scale(t, 0.25, 0, 0.765), P.black, L(3.1), INK, 0);
+  });
+  b.ring('woven band');
+  // green scalloped band with woven maroon rings
+  b.rosette(prof(n, 0.655, 0.745, 'round'), P.maroon, L(3.5), n, INK, 0.005);
+  b.rosette(prof(n, 0.635, 0.722, 'round'), P.green, L(3.7), n, INK, 0.004);
+  b.rosette(prof(n, 0.61, 0.69, 'round'), P.gold, L(3.9), n, INK, 0.004);
+  const rings = [];
+  for (let k = 0; k < 24; k++) { const [x, y] = pol(0.565, k * TAU / 24); rings.push({ x, y, r: 0.12, w: 0.02, hex: P.maroonL }); }
+  b.weave(rings, L(4.5), 0.0009, 0.004);
+  b.repeat(24, () => { b.dot(0, 0.62, 0.011, P.black, L(4.2)); }, 0.5);
+  b.repeat(24, () => { b.dot(0, 0.51, 0.008, P.black, L(4.2)); });
+  b.ring('inner ring');
+  // white C-arcs and the inner ring
+  b.ringFill(circ(0.47), P.green, L(5), n);
+  b.repeat(n, () => { b.line(arcPts(0, 0.44, 0.052, -1.6, 1.6), 0.016, P.white, L(5.3)); }, 0.5);
+  b.ringLine(circ(0.44), 0.014, P.maroon, L(5.5), n);
+  b.ringFill(circ(0.433), P.greenD, L(5.6), n);
+  b.ring('arches');
+  // green arches with nested maroon/gold
+  b.repeat(n, () => {
+    const a = lens(0.255, 0.44, 0.09, 0.4, 0.95);
+    b.shape(a, P.greenL, L(6), INK, 0.006);
+    b.shape(scale(a, 0.72, 0, 0.36), P.maroonL, L(6.2), INK, 0.003);
+    b.shape(scale(a, 0.48, 0, 0.36), P.gold, L(6.4), INK, 0.003);
+    b.shape(scale(a, 0.22, 0, 0.35), P.black, L(6.6), INK, 0);
+  });
+  b.ring('chevron star');
+  // chevron star
+  b.ringFill(circ(0.3), P.maroon, L(7), n);
+  b.ringLine(prof(n, 0.225, 0.3, 'zig', 0.5), 0.022, P.white, L(7.3), n);
+  b.ringLine(prof(n, 0.2, 0.265, 'zig', 0.5), 0.012, P.goldL, L(7.4), n);
+  b.rosette(prof(n, 0.135, 0.205, 'zig'), P.maroonL, L(7.6), n, INK, 0.004);
+  b.dotsAlong(prof(n, 0.15, 0.2, 'zig'), n * 8, 0.0045, P.white, L(7.8));
+  b.ring('daisy');
+  // daisy
+  b.circle(0, 0, 0.115, P.gold, L(8));
+  b.repeat(n, () => { b.shape(lens(0.04, 0.108, 0.026, 0.7, 1), P.green, L(8.2), INK, 0.003); });
+  b.repeat(n, () => { b.shape(lens(0.02, 0.07, 0.014, 0.5, 0.6), P.white, L(8.5), INK, 0.003); }, 0.5);
+  b.circle(0, 0, 0.022, P.black, L(8.8));
+} });
+
+// 4 ─ Saffron / brown: striped fans, nested dotted ogee bands, fish scales, sun petals, teardrops, flower
+DESIGNS.push({ name: 'Saffron', bg: 0x1d1208, build(b) {
+  INK = 0x1f140d;
+  const P = { paper: 0xfbf7ef, black: 0x1e140e, brown: 0x6e3519, brownD: 0x42200f, rust: 0x9b4a1e, orange: 0xea920f, orangeL: 0xf2a72a, yellow: 0xf4c419, yellowL: 0xf8de63, white: 0xfaf6ee };
+  const n = 12;
+  b.ring('fish scales');
+  b.ringFill(circ(0.87), P.black, L(0), n);
+  // fish-scale clusters between the fans
+  b.repeat(n, () => {
+    [[0.815, 1], [0.785, 2], [0.755, 3], [0.725, 4], [0.695, 5]].forEach(([y, count], ri) => {
+      for (let i = 0; i < count; i++) {
+        const x = (i - (count - 1) / 2) * 0.034;
+        const pts = arcPts(x, y, 0.018, -Math.PI / 2, Math.PI / 2, 16); pts.push([x, y - 0.004]);
+        b.shape(pts, (i + ri) % 2 ? P.yellow : P.orange, L(0.5 + ri * 0.08), INK, 0.0035);
+      }
+    });
+  }, 0.5);
+  b.ring('striped fans');
+  // striped fans with a scalloped edge
+  b.repeat(n, () => {
+    const cy = 0.8, cols = [P.brown, P.orange, P.yellowL, P.rust, P.yellow, P.white, P.brown, P.orangeL];
+    cols.forEach((c, i) => {
+      const R = 0.2 - i * 0.022, N = 90, pts = [];
+      for (let k = 0; k <= N; k++) { const a = -Math.PI * 0.55 + k / N * Math.PI * 1.1; const rr = R + (i === 0 ? 0.006 * Math.abs(Math.sin(a * 9)) : 0); pts.push([rr * Math.sin(a), cy + rr * Math.cos(a)]); }
+      pts.push([0, cy - R * 0.4]);
+      b.shape(pts, c, L(1.2 + i * 0.12), INK, i === 0 ? 0.007 : 0.0035);
+    });
+  });
+  b.ring('lobed bands');
+  // nested lobed bands, all pointing at the fans
+  b.rosette(prof(n, 0.6, 0.805, 'petal'), P.white, L(2.5), n, INK, 0.008);
+  b.dotsAlong(prof(n, 0.59, 0.79, 'petal'), n * 16, 0.0045, P.brown, L(2.6));
+  b.rosette(prof(n, 0.572, 0.765, 'petal'), P.brown, L(2.7), n, INK, 0.004);
+  b.dotsAlong(prof(n, 0.562, 0.748, 'petal'), n * 15, 0.0048, P.black, L(2.8));
+  b.rosette(prof(n, 0.55, 0.728, 'petal'), P.brownD, L(3), n, INK, 0.006);
+  b.rosette(prof(n, 0.53, 0.698, 'petal'), P.yellow, L(3.2), n, INK, 0.004);
+  b.dotsAlong(prof(n, 0.517, 0.68, 'petal'), n * 14, 0.0055, P.black, L(3.3));
+  b.rosette(prof(n, 0.5, 0.66, 'petal'), P.orange, L(3.4), n, INK, 0.004);
+  b.rosette(prof(n, 0.478, 0.628, 'petal'), P.brown, L(3.6), n, INK, 0.004);
+  b.dotsAlong(prof(n, 0.468, 0.613, 'petal'), n * 13, 0.0042, P.black, L(3.7));
+  b.rosette(prof(n, 0.455, 0.6, 'petal'), P.orange, L(3.8), n, INK, 0.004);
+  b.ring('sun petals');
+  // sun petals with tick rays
+  b.rosette(prof(n, 0.43, 0.575, 'petal', 0.5), 0xf6b62c, L(4.2), n, INK, 0.005);
+  for (let k = 0; k < 132; k++) { const t = k / 132 * TAU; b.line([pol(0.426, t), pol(0.462 + 0.008 * Math.sin(k * 2.3), t)], 0.0035, P.brown, L(4.4)); }
+  b.ringLine(circ(0.425), 0.008, P.brown, L(4.5), n);
+  b.ringFill(circ(0.42), P.brownD, L(4.6), n);
+  b.ring('star & teardrops');
+  b.rosette(prof(n, 0.27, 0.42, 'zig'), P.yellow, L(4.8), n, INK, 0.004);
+  // teardrops
+  b.repeat(n, () => {
+    const t = lens(0.255, 0.395, 0.06, 0.5, 1.2);
+    b.shape(t, P.brown, L(5.1), INK, 0.004);
+    b.shape(scale(t, 0.74, 0, 0.315), P.orange, L(5.3), INK, 0.003);
+    b.shape(scale(t, 0.48, 0, 0.31), P.yellow, L(5.5), INK, 0.003);
+    b.shape(lens(0.285, 0.33, 0.012, 0.5, 1.2), P.brown, L(5.7), INK, 0);
+  });
+  b.ring('white centre');
+  // white centre with rounded diamonds
+  b.ringFill(circ(0.255), P.white, L(6), n);
+  b.repeat(n, () => { const d = rhombus(0.205, 0.036, 0.032); b.shape(d, P.brown, L(6.2), INK, 0.004); b.dot(0, 0.205, 0.012, P.yellow, L(6.4)); }, 0.5);
+  b.repeat(n, () => { const d = rhombus(0.14, 0.028, 0.024); b.shape(d, P.brown, L(6.2), INK, 0.004); b.shape(lens(0.128, 0.152, 0.009), P.yellowL, L(6.4), INK, 0.002); });
+  b.repeat(n, () => { b.shape(lens(0.075, 0.108, 0.014, 0.6, 1), P.rust, L(6.3), INK, 0.003); }, 0.5);
+  b.circle(0, 0, 0.068, P.yellow, L(6.6));
+  b.repeat(16, () => { b.shape(lens(0.012, 0.064, 0.011, 0.7, 1), P.brown, L(6.8), INK, 0.002); });
+  b.circle(0, 0, 0.014, P.orange, L(7));
+} });
+
+// ───────────────────────── scene ─────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: SHOT });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setFoveation(0.4);
+document.body.appendChild(renderer.domElement);
+if (SHOT) document.body.classList.add('shot');
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.02, 60);
+camera.position.set(0, 1.45, 1.35);
+// lit so a face-on view shows the true marker colours; tilting adds gentle shading
+scene.add(new THREE.AmbientLight(0xffffff, 2.85));
+const sun = new THREE.DirectionalLight(0xffffff, 0.5); sun.position.set(0.5, 1.2, 2); scene.add(sun);
+
+const holder = new THREE.Group(); holder.position.set(0, 1.45, 0); scene.add(holder);
+const spinner = new THREE.Group(); spinner.scale.setScalar(WORLD_R); holder.add(spinner);
+const material = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+
+const EXPLODE_GAP = 0.055 / WORLD_R; // ring spacing at full explode (5.5 cm), in mandala units
+const IDQ = new THREE.Quaternion(), ZAXIS = new THREE.Vector3(0, 0, 1);
+const designs = []; // { group, rings: [{ mesh, index, rMin, rMax, zMid, home, held }] }
+const buildDesign = (i) => {
+  if (designs[i]) return designs[i];
+  const t0 = performance.now(); const b = new Builder(1234 + i * 77); DESIGNS[i].build(b);
+  const group = new THREE.Group(); group.visible = false; spinner.add(group);
+  let tris = 0;
+  const rings = b.build().map((p, index) => {
+    const mesh = new THREE.Mesh(p.geometry, material); mesh.name = p.name; group.add(mesh);
+    tris += p.geometry.attributes.position.count / 3;
+    const ring = { mesh, index, rMin: p.rMin, rMax: p.rMax, zMid: p.zMid, home: new THREE.Vector3(), homeQ: new THREE.Quaternion(), spin: 0, held: 0 };
+    mesh.userData.ring = ring; return ring;
+  });
+  designs[i] = { group, rings };
+  console.log(`${DESIGNS[i].name}: ${rings.length} rings, ${tris | 0} triangles, ${(performance.now() - t0) | 0} ms`);
+  return designs[i];
+};
+let current = -1;
+const show = (i) => {
+  i = ((i % DESIGNS.length) + DESIGNS.length) % DESIGNS.length;
+  releaseAll();
+  buildDesign(i);
+  designs.forEach((d, k) => { if (d) d.group.visible = k === i; });
+  current = i;
+  if (!inMR) scene.background = bgColor.setHex(DESIGNS[i].bg);
+  document.querySelectorAll('#ui [data-m]').forEach((el) => el.classList.toggle('on', +el.dataset.m === i));
+  pickers.forEach((p, k) => p.ring.material.color.setHex(k === i ? 0xffffff : 0x6c5a7c));
+};
+
+// ── exploded view + spring-back ──
+const explodeEl = document.getElementById('explode');
+let explode = 0;
+const setExplode = (v) => { explode = THREE.MathUtils.clamp(v, 0, 1); if (explodeEl) explodeEl.value = explode; };
+explodeEl.addEventListener('input', () => setExplode(+explodeEl.value));
+document.getElementById('reset').onclick = () => { resetSpins(); setExplode(0); };
+let heldCount = 0;
+/** In-plane angle of a ring's current orientation (twist about the mandala axis). */
+const twistOf = (q) => 2 * Math.atan2(q.z, q.w);
+const resetSpins = () => designs.forEach((d) => d && d.rings.forEach((r) => (r.spin = 0)));
+const updateRings = (dt) => {
+  const d = designs[current]; if (!d) return;
+  const k = 1 - Math.exp(-dt * 6); // gentle spring towards home
+  for (const r of d.rings) {
+    r.home.set(0, 0, explode * r.index * EXPLODE_GAP); r.homeQ.setFromAxisAngle(ZAXIS, r.spin);
+    if (!r.held) { r.mesh.position.lerp(r.home, k); r.mesh.quaternion.slerp(r.homeQ, k); } // back into the stack, keeping its own spin
+  }
+};
+
+// ── holding a ring: it follows a pose (hand, controller or mouse point) rigidly ──
+const _hand = new THREE.Matrix4(), _loc = new THREE.Matrix4(), _one = new THREE.Vector3(1, 1, 1), _scl = new THREE.Vector3();
+const _qz = new THREE.Quaternion();
+const grabRing = (g, ring, pos, quat) => {
+  g.ring = ring; g.extra = 0; ring.held++; heldCount++;
+  ring.mesh.updateWorldMatrix(true, false);
+  _hand.compose(pos, quat, _one).invert(); g.off.multiplyMatrices(_hand, ring.mesh.matrixWorld);
+};
+const moveRing = (g, pos, quat) => {
+  const mesh = g.ring.mesh; mesh.parent.updateWorldMatrix(true, false);
+  _hand.compose(pos, quat, _one).multiply(g.off);
+  _loc.copy(mesh.parent.matrixWorld).invert().multiply(_hand);
+  _loc.decompose(mesh.position, mesh.quaternion, _scl);
+  if (g.extra) mesh.quaternion.multiply(_qz.setFromAxisAngle(ZAXIS, g.extra)); // thumbstick spin about the ring's own axis
+};
+const dropRing = (g) => { if (!g.ring) return; g.ring.spin = twistOf(g.ring.mesh.quaternion); g.extra = 0; g.ring.held--; heldCount--; g.ring = null; };
+const releaseAll = () => {
+  if (typeof hands !== 'undefined') hands.forEach((h) => { if (h.mode === 2) dropRing(h.rg); h.mode = 0; });
+  if (typeof mouseGrab !== 'undefined' && mouseGrab.ring) { dropRing(mouseGrab); controls.enabled = true; }
+  grabMode = 0;
+};
+const bgColor = new THREE.Color();
+let inMR = false;
+
+// in-world switcher: four small swatches below the mandala (poke with a finger or controller)
+const pickerGroup = new THREE.Group(); scene.add(pickerGroup);
+const swatches = [0x8a43ab, 0x9c1f2f, 0x1f6f46, 0xea920f];
+const pickers = swatches.map((hex, i) => {
+  const g = new THREE.Group(); g.position.set((i - 1.5) * 0.11, 0, 0);
+  const disc = new THREE.Mesh(new THREE.CircleGeometry(0.035, 40), new THREE.MeshBasicMaterial({ color: hex }));
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.037, 0.043, 40), new THREE.MeshBasicMaterial({ color: 0x6c5a7c }));
+  g.add(disc, ring); pickerGroup.add(g); return { g, ring };
+});
+pickerGroup.visible = false;
+
+// desktop controls
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.45, 0); controls.enableDamping = true; controls.minDistance = 0.35; controls.maxDistance = 4; controls.update();
+
+// desktop ring dragging: press on a ring to pull it out (moves in a plane facing the camera); empty space orbits
+const raycaster = new THREE.Raycaster(), ndc = new THREE.Vector2(), dragPlane = new THREE.Plane(), dragPoint = new THREE.Vector3(), camDir = new THREE.Vector3();
+const mouseGrab = { ring: null, off: new THREE.Matrix4(), extra: 0, spinning: false, a0: 0, spin0: 0 };
+const spinLocal = new THREE.Vector3();
+const setNdc = (e) => { const r = renderer.domElement.getBoundingClientRect(); ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1); };
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (renderer.xr.isPresenting || (e.button !== 0 && e.button !== 2) || !designs[current]) return;
+  setNdc(e); raycaster.setFromCamera(ndc, camera); designs[current].group.updateWorldMatrix(true, true);
+  const hit = raycaster.intersectObjects(designs[current].group.children, false)[0];
+  if (!hit) return;
+  controls.enabled = false; // runs before OrbitControls' own handler, so it won't orbit
+  const ring = hit.object.userData.ring;
+  if (e.shiftKey || e.button === 2) {
+    // spin: turn the ring around the mandala's centre, in its own plane
+    const grp = designs[current].group; camDir.set(0, 0, 1).transformDirection(grp.matrixWorld);
+    dragPlane.setFromNormalAndCoplanarPoint(camDir, hit.point);
+    spinLocal.copy(hit.point); grp.worldToLocal(spinLocal);
+    mouseGrab.spinning = true; mouseGrab.a0 = Math.atan2(spinLocal.y, spinLocal.x); mouseGrab.spin0 = twistOf(ring.mesh.quaternion);
+    mouseGrab.ring = ring; mouseGrab.extra = 0; ring.held++; heldCount++;
+  } else {
+    mouseGrab.spinning = false;
+    dragPlane.setFromNormalAndCoplanarPoint(camera.getWorldDirection(camDir).negate(), hit.point);
+    grabRing(mouseGrab, ring, hit.point, IDQ);
+  }
+  renderer.domElement.setPointerCapture(e.pointerId);
+}, { capture: true });
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (!mouseGrab.ring) return;
+  setNdc(e); raycaster.setFromCamera(ndc, camera);
+  if (!raycaster.ray.intersectPlane(dragPlane, dragPoint)) return;
+  if (mouseGrab.spinning) {
+    spinLocal.copy(dragPoint); designs[current].group.worldToLocal(spinLocal);
+    mouseGrab.ring.mesh.quaternion.setFromAxisAngle(ZAXIS, mouseGrab.spin0 + Math.atan2(spinLocal.y, spinLocal.x) - mouseGrab.a0);
+  } else moveRing(mouseGrab, dragPoint, IDQ);
+});
+const endMouse = () => { if (!mouseGrab.ring) return; dropRing(mouseGrab); controls.enabled = true; };
+renderer.domElement.addEventListener('pointerup', endMouse);
+renderer.domElement.addEventListener('pointercancel', endMouse);
+renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// shot mode: straight-on orthographic view on white for photo comparison
+let shotCam = null;
+if (SHOT) {
+  const s = WORLD_R * 1.02; shotCam = new THREE.OrthographicCamera(-s, s, s, -s, 0.01, 10); shotCam.position.set(0, 1.45, 2); shotCam.lookAt(0, 1.45, 0);
+  renderer.setPixelRatio(1); renderer.setSize(+params.get('size') || 900, +params.get('size') || 900);
+}
+
+// ───────────────────────── XR interaction ─────────────────────────
+const ctlFactory = new XRControllerModelFactory();
+const handFactory = new XRHandModelFactory();
+const hands = [0, 1].map((i) => {
+  const ctl = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i), hand = renderer.xr.getHand(i);
+  grip.add(ctlFactory.createControllerModel(grip)); hand.add(handFactory.createHandModel(hand, 'mesh'));
+  scene.add(ctl, grip, hand);
+  // mode: 0 idle, 1 holding the whole mandala, 2 holding one ring
+  const h = { i, ctl, grip, hand, isHand: false, src: null, mode: 0, rg: { ring: null, off: new THREE.Matrix4(), extra: 0 }, pos: new THREE.Vector3(), quat: new THREE.Quaternion(), poke: new THREE.Vector3(), axisLatch: false, btnLatch: false, resetLatch: false };
+  ctl.addEventListener('connected', (e) => { h.src = e.data; h.isHand = !!e.data.hand; });
+  ctl.addEventListener('disconnected', () => { endGrab(h); h.src = null; });
+  ctl.addEventListener('selectstart', () => beginGrab(h, false));  // trigger / pinch: a ring if you're touching one
+  ctl.addEventListener('squeezestart', () => beginGrab(h, true));  // grip: always the whole mandala
+  ctl.addEventListener('selectend', () => endGrab(h)); ctl.addEventListener('squeezeend', () => endGrab(h));
+  return h;
+});
+
+// preallocated temporaries — nothing is allocated per frame
+const tA = new THREE.Vector3(), tB = new THREE.Vector3(), tC = new THREE.Vector3(), tQ = new THREE.Quaternion(), tQ2 = new THREE.Quaternion();
+const g1 = { hPos: new THREE.Vector3(), hQuatInv: new THREE.Quaternion(), oPos: new THREE.Vector3(), oQuat: new THREE.Quaternion() };
+const g2 = { dist: 1, scale: 1, e0: 0, axis: new THREE.Vector3(), normal: new THREE.Vector3(), mid: new THREE.Vector3(), oPos: new THREE.Vector3(), oQuat: new THREE.Quaternion() };
+let grabMode = 0; // whole-mandala grab: 0 none, 1 one hand, 2 two hands
+const whole = []; // reused list of hands holding the whole mandala
+const J_THUMB = 'thumb-tip', J_INDEX = 'index-finger-tip', J_WRIST = 'wrist';
+const TOUCH = 0.06; // metres: how close to a layer counts as touching it
+
+const readPose = (h) => {
+  if (h.isHand) {
+    const j = h.hand.joints, th = j[J_THUMB], ix = j[J_INDEX], wr = j[J_WRIST];
+    if (!th || !ix || !wr) return false;
+    h.pos.copy(th.position).add(ix.position).multiplyScalar(0.5); h.quat.copy(wr.quaternion); h.poke.copy(ix.position);
+  } else { h.grip.getWorldPosition(h.pos); h.grip.getWorldQuaternion(h.quat); h.poke.copy(h.pos); }
+  return true;
+};
+/** The ring under the hand: inside its radial band and nearest in depth (exploded layers are easy to single out). */
+const pickRing = (pos) => {
+  const d = designs[current]; if (!d) return null;
+  d.group.updateWorldMatrix(true, false); tA.copy(pos); d.group.worldToLocal(tA);
+  const r = Math.hypot(tA.x, tA.y); if (r > 1.05) return null;
+  let best = null, bestDz = TOUCH / (WORLD_R * holder.scale.x);
+  for (let k = d.rings.length - 1; k >= 0; k--) {
+    const ring = d.rings[k]; if (r < ring.rMin - 0.02 || r > ring.rMax + 0.02) continue;
+    const dz = Math.abs(tA.z - (ring.mesh.position.z + ring.zMid)); if (dz < bestDz - 1e-4) { best = ring; bestDz = dz; }
+  }
+  return best;
+};
+const collectWhole = () => { whole.length = 0; for (const h of hands) if (h.mode === 1) whole.push(h); return whole; };
+const startOne = (h) => { readPose(h); g1.hPos.copy(h.pos); g1.hQuatInv.copy(h.quat).invert(); g1.oPos.copy(holder.position); g1.oQuat.copy(holder.quaternion); grabMode = 1; };
+const startTwo = (a, c) => {
+  readPose(a); readPose(c); g2.dist = Math.max(0.02, a.pos.distanceTo(c.pos)); g2.scale = holder.scale.x; g2.e0 = explode;
+  g2.axis.subVectors(c.pos, a.pos).normalize(); g2.mid.addVectors(a.pos, c.pos).multiplyScalar(0.5);
+  g2.normal.set(0, 0, 1).applyQuaternion(holder.quaternion); g2.oPos.copy(holder.position); g2.oQuat.copy(holder.quaternion); grabMode = 2;
+};
+const restartWhole = () => { const w = collectWhole(); if (w.length >= 2) startTwo(w[0], w[1]); else if (w.length === 1) startOne(w[0]); else grabMode = 0; };
+function beginGrab(h, wholeOnly) {
+  if (h.mode || (pokeCooldown > 0 && h.isHand) || !readPose(h)) return;
+  const ring = wholeOnly ? null : pickRing(h.pos);
+  if (ring) { h.mode = 2; grabRing(h.rg, ring, h.pos, h.quat); return; }
+  h.mode = 1; restartWhole();
+}
+function endGrab(h) {
+  if (h.mode === 2) { dropRing(h.rg); h.mode = 0; return; }
+  if (h.mode === 1) { h.mode = 0; restartWhole(); }
+}
+
+const updateGrab = () => {
+  for (const h of hands) if (h.mode === 2 && readPose(h)) moveRing(h.rg, h.pos, h.quat);
+  const w = collectWhole();
+  if (grabMode === 1 && w.length === 1) {
+    const h = w[0]; if (!readPose(h)) return;
+    tQ.multiplyQuaternions(h.quat, g1.hQuatInv);                       // hand rotation since grab
+    holder.quaternion.multiplyQuaternions(tQ, g1.oQuat);
+    tA.subVectors(g1.oPos, g1.hPos).applyQuaternion(tQ); holder.position.addVectors(h.pos, tA);
+  } else if (grabMode === 2 && w.length >= 2) {
+    const a = w[0], c = w[1]; if (!readPose(a) || !readPose(c)) return;
+    const s = THREE.MathUtils.clamp(g2.scale * a.pos.distanceTo(c.pos) / g2.dist, 0.25, 4);
+    tB.subVectors(c.pos, a.pos).normalize(); tQ2.setFromUnitVectors(g2.axis, tB);
+    holder.quaternion.multiplyQuaternions(tQ2, g2.oQuat); holder.scale.setScalar(s);
+    // pulling both hands towards you (along the mandala's facing) explodes the layers instead of moving it
+    tA.addVectors(a.pos, c.pos).multiplyScalar(0.5);
+    const along = tC.subVectors(tA, g2.mid).dot(g2.normal);
+    setExplode(g2.e0 + along / 0.25);
+    tA.addScaledVector(g2.normal, -along);
+    tB.subVectors(g2.oPos, g2.mid).applyQuaternion(tQ2).multiplyScalar(s / g2.scale); holder.position.addVectors(tA, tB);
+  }
+};
+
+let pokeCooldown = 0;
+const updatePickers = (dt) => {
+  pokeCooldown = Math.max(0, pokeCooldown - dt);
+  for (const h of hands) {
+    if (!h.src) continue;
+    if (h.mode === 0 && readPose(h) && pokeCooldown === 0) {
+      for (let k = 0; k < pickers.length; k++) { pickers[k].g.getWorldPosition(tA); if (tA.distanceTo(h.poke) < 0.045) { show(k); pokeCooldown = 0.6; break; } }
+    }
+    const gp = h.src.gamepad; if (!gp) continue;
+    const x = gp.axes.length > 2 ? gp.axes[2] : 0, y = gp.axes.length > 3 ? gp.axes[3] : 0;
+    const reset = gp.buttons[5] && gp.buttons[5].pressed;
+    if (reset && !h.resetLatch) resetSpins(); h.resetLatch = !!reset;
+    if (h.mode === 2) { if (Math.abs(x) > 0.15) h.rg.extra -= x * dt * 2.5; continue; } // holding a ring: stick spins it
+    if (Math.abs(x) > 0.7 && !h.axisLatch) { h.axisLatch = true; show(current + (x > 0 ? 1 : -1)); } else if (Math.abs(x) < 0.3) h.axisLatch = false;
+    if (Math.abs(y) > 0.2 && Math.abs(x) < 0.5) setExplode(explode - y * dt * 0.8); // stick forward = explode
+    const btn = gp.buttons[4] && gp.buttons[4].pressed;
+    if (btn && !h.btnLatch) show(current + 1); h.btnLatch = !!btn;
+  }
+};
+
+// sessions
+const placeForXR = () => {
+  holder.position.set(0, 1.35, -0.85); holder.quaternion.identity(); holder.scale.setScalar(1);
+  pickerGroup.position.set(0, 1.35 - WORLD_R - 0.12, -0.75); pickerGroup.rotation.x = -0.35; pickerGroup.visible = true;
+};
+const startSession = async (mode) => {
+  const session = await navigator.xr.requestSession(mode, { requiredFeatures: ['local-floor'], optionalFeatures: ['hand-tracking', 'bounded-floor', 'layers'] });
+  inMR = mode === 'immersive-ar';
+  scene.background = inMR ? null : bgColor.setHex(DESIGNS[current].bg);
+  renderer.xr.setReferenceSpaceType('local-floor');
+  await renderer.xr.setSession(session);
+  placeForXR();
+  session.addEventListener('end', () => {
+    inMR = false; pickerGroup.visible = false; releaseAll();
+    holder.position.set(0, 1.45, 0); holder.quaternion.identity(); holder.scale.setScalar(1);
+    scene.background = bgColor.setHex(DESIGNS[current].bg);
+  });
+};
+if (navigator.xr && !SHOT) {
+  const vr = document.getElementById('vr'), mr = document.getElementById('mr');
+  navigator.xr.isSessionSupported('immersive-vr').then((ok) => { vr.disabled = !ok; if (!ok) vr.textContent = 'VR not available'; });
+  navigator.xr.isSessionSupported('immersive-ar').then((ok) => { mr.disabled = !ok; if (!ok) mr.textContent = 'MR not available'; });
+  vr.onclick = () => startSession('immersive-vr').catch((e) => alert(e.message));
+  mr.onclick = () => startSession('immersive-ar').catch((e) => alert(e.message));
+} else if (!SHOT) { document.getElementById('vr').textContent = 'VR not available'; document.getElementById('mr').textContent = 'MR not available'; }
+
+document.querySelectorAll('#ui [data-m]').forEach((el) => (el.onclick = () => show(+el.dataset.m)));
+addEventListener('keydown', (e) => { if (e.key >= '1' && e.key <= '4') show(+e.key - 1); });
+addEventListener('resize', () => { if (SHOT) return; camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+
+// ───────────────────────── go ─────────────────────────
+show(+(params.get('m') || 0));
+if (SHOT) {
+  scene.background = new THREE.Color(0xffffff);
+  renderer.render(scene, shotCam);
+  document.title = 'ready';
+} else {
+  // build the other designs in the background so switching is instant later
+  let next = 0; const idle = () => { while (next < DESIGNS.length && designs[next]) next++; if (next < DESIGNS.length) { buildDesign(next); setTimeout(idle, 30); } };
+  setTimeout(idle, 300);
+  const clock = new THREE.Clock();
+  const tick = (dt) => {
+    if (renderer.xr.isPresenting) { updateGrab(); updatePickers(dt); } else controls.update();
+    if (grabMode === 0 && heldCount === 0) spinner.rotation.z += dt * 0.06;
+    updateRings(dt);
+    renderer.render(scene, camera);
+  };
+  renderer.setAnimationLoop(() => tick(Math.min(0.05, clock.getDelta())));
+}
+</script>
+<script>
+  // offline support: cache the page, vendor files and icons (see sw.js)
+  if ('serviceWorker' in navigator) addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch((e) => console.warn('Service worker not registered:', e)));
+</script>
+</body>
+</html>

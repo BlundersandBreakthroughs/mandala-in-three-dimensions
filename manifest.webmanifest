@@ -1,0 +1,31 @@
+{
+  "name": "Mandala Madness",
+  "short_name": "Mandala",
+  "description": "Four hand-drawn mandalas, rebuilt in code as layered 3D you can pull apart in VR and MR.",
+  "start_url": "/mandala-in-three-dimensions/",
+  "scope": "/mandala-in-three-dimensions/",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#160c1f",
+  "background_color": "#160c1f",
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
