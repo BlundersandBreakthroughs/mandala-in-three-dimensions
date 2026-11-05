@@ -795,7 +795,7 @@ const pickers = swatches.map((hex, i) => {
   const g = new THREE.Group(); g.position.set((i - 1.5) * 0.11, 0, 0);
   const disc = new THREE.Mesh(new THREE.CircleGeometry(0.035, 40), new THREE.MeshBasicMaterial({ color: hex }));
   const ring = new THREE.Mesh(new THREE.RingGeometry(0.037, 0.043, 40), new THREE.MeshBasicMaterial({ color: 0x6c5a7c }));
-  g.add(disc, ring); pickerGroup.add(g); return { g, ring };
+  g.add(disc, ring); pickerGroup.add(g); return { g, ring, press: 0 };
 });
 pickerGroup.visible = false;
 
@@ -888,13 +888,14 @@ const drawButton = (b) => {
 };
 buttons.forEach(drawButton);
 const hintPlane = canvasPlane(0.4, 0.05, 1024); hintPlane.mesh.position.set(0, -0.085, 0.003); panel.add(hintPlane.mesh);
-const HINT = 'Pinch + swipe a ring to rotate · double pinch to duplicate';
+const HINT = 'Pinch + swipe a ring to rotate · double pinch to duplicate · pinch a colour to switch';
 let hintText = '', sessionT = 0, msgUntil = 0, msgText = '';
 const drawHint = (text) => {
   if (text === hintText) return; hintText = text;
   const c = hintPlane.ctx, W = hintPlane.cv.width, H = hintPlane.cv.height;
   c.clearRect(0, 0, W, H); c.fillStyle = 'rgba(244, 236, 255, 0.95)'; c.textAlign = 'center'; c.textBaseline = 'middle';
-  c.font = '500 40px system-ui, sans-serif'; c.fillText(text, W / 2, H / 2); hintPlane.tex.needsUpdate = true;
+  let size = 40; do { c.font = `500 ${size}px system-ui, sans-serif`; } while (c.measureText(text).width > W - 40 && --size > 20); // shrink to fit
+  c.fillText(text, W / 2, H / 2); hintPlane.tex.needsUpdate = true;
 };
 /** Brief message in the hint line (e.g. the copy limit). */
 const flash = (text, secs = 2.5) => { msgText = text; msgUntil = sessionT + secs; };
@@ -904,6 +905,11 @@ const updatePanel = (dt) => {
   if (sessionT < msgUntil) { drawHint(msgText); op = 1; }
   else { drawHint(HINT); op = THREE.MathUtils.clamp(11 - sessionT, 0, 1); } // the hint fades out after 10 s
   hintPlane.mesh.material.opacity = op; hintPlane.mesh.visible = op > 0.01;
+  for (let k = 0; k < pickers.length; k++) {
+    const pk = pickers[k]; let hover = false; for (const h of hands) if (h.aimSwatch === k) hover = true;
+    if (pk.press > 0) pk.press = Math.max(0, pk.press - dt);
+    pk.g.scale.setScalar((hover ? 1.18 : 1) * (1 - 0.15 * Math.sin(Math.PI * (pk.press / 0.2))));
+  }
   for (const b of buttons) {
     b.hover = 0; for (const h of hands) if (h.aimBtn === b) b.hover++;
     b.on = b.id === 'apart' && explodeTarget > 0.5;
@@ -958,7 +964,7 @@ const hands = [0, 1].map((i) => {
   const h = {
     i, ctl, hand, line, dot, src: null, isHand: false, live: false,
     ray: new THREE.Ray(), pinch: new THREE.Vector3(), poke: new THREE.Vector3(), start: new THREE.Vector3(),
-    aimType: null, aimInst: null, aimBtn: null, aimDist: 0, aimPoint: new THREE.Vector3(),
+    aimType: null, aimInst: null, aimBtn: null, aimSwatch: -1, aimDist: 0, aimPoint: new THREE.Vector3(),
     pinching: false, t0: 0, mode: 'none', target: null, drag: makeDrag(), lastTap: -10, lastTapInst: null,
   };
   ctl.addEventListener('connected', (e) => { h.src = e.data; h.isHand = !!e.data.hand; });
@@ -987,10 +993,18 @@ const aim = (h) => {
     _w.copy(_hit).applyMatrix4(panel.matrixWorld); h.aimDist = _w.distanceTo(h.ray.origin); h.aimPoint.copy(_w); h.aimType = 'panel';
     for (const b of buttons) if (Math.abs(_hit.x - b.x) < BTN_W / 2 && Math.abs(_hit.y - b.y) < BTN_H / 2) { h.aimBtn = b; h.aimType = 'button'; }
   }
+  h.aimSwatch = -1;
+  if (pickerGroup.visible && hitPlaneOf(pickerGroup, h.ray, 0, _hit)) {
+    for (let k = 0; k < pickers.length; k++) {
+      if (Math.hypot(_hit.x - pickers[k].g.position.x, _hit.y) > 0.05) continue; // 5 cm target around each 3.5 cm swatch
+      _w.copy(_hit).applyMatrix4(pickerGroup.matrixWorld); const d = _w.distanceTo(h.ray.origin);
+      if (d < h.aimDist) { h.aimDist = d; h.aimPoint.copy(_w); h.aimType = 'swatch'; h.aimSwatch = k; h.aimBtn = null; }
+    }
+  }
   for (const m of mandalas) {
     if (!hitPlaneOf(m.body, h.ray, 0, _hit) || Math.hypot(_hit.x, _hit.y) > 1.02) continue;
     _w.copy(_hit).applyMatrix4(m.body.matrixWorld); const d = _w.distanceTo(h.ray.origin);
-    if (d < h.aimDist) { h.aimDist = d; h.aimPoint.copy(_w); h.aimType = 'mandala'; h.aimInst = m; h.aimBtn = null; }
+    if (d < h.aimDist) { h.aimDist = d; h.aimPoint.copy(_w); h.aimType = 'mandala'; h.aimInst = m; h.aimBtn = null; h.aimSwatch = -1; }
   }
 };
 
@@ -1017,6 +1031,7 @@ function pinchStart(h) {
   readHand(h); aim(h);
   h.pinching = true; h.t0 = clockT; h.start.copy(h.pinch); h.mode = 'idle'; h.target = null;
   if (h.aimType === 'button') { h.mode = 'panel'; pressButton(h.aimBtn); return; }
+  if (h.aimType === 'swatch') { h.mode = 'panel'; show(h.aimSwatch); pickers[h.aimSwatch].press = 0.2; return; }
   if (h.aimType !== 'mandala') return;
   h.target = h.aimInst;
   const o = hands[1 - h.i];

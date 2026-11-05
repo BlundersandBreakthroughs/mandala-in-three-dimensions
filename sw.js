@@ -3,7 +3,7 @@
 // Every entry is resolved against this worker's own location, so the cache holds
 // full sub-path URLs (…/mandala-in-three-dimensions/index.html), never domain-root ones.
 // Bump VERSION whenever any cached file changes.
-const VERSION = 'mandala-v3';
+const VERSION = 'mandala-v4';
 const BASE = new URL('./', self.location.href); // …/mandala-in-three-dimensions/
 const FILES = [
   './',
