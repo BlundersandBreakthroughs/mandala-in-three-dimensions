@@ -31,7 +31,7 @@
 </script>
 </head>
 <body>
-<div id="hint">Drag a ring to pull it out · Shift-drag or right-drag a ring to spin it · drag empty space to orbit · Explode slider spreads the layers · 1–4 switch · in VR: pinch/trigger a ring to pull it, twist your wrist (or use the stick) to spin it, B/Y resets spins, grip or pinch away from it to move the whole mandala, two hands to scale and push/pull to explode</div>
+<div id="hint">Drag a ring to pull it out · Shift-drag or right-drag a ring to spin it · drag empty space to orbit · Explode slider spreads the layers · 1–4 switch · in VR with hand tracking: pinch + swipe a ring to rotate it, double pinch to duplicate, pinch with both hands to move and scale, use the panel to pull apart, clear copies or exit</div>
 <div id="ui">
   <button data-m="0">Purple</button><button data-m="1">Crimson</button><button data-m="2">Emerald</button><button data-m="3">Saffron</button>
   <span class="sep"></span>
@@ -43,7 +43,6 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
 import { XRHandModelFactory } from 'three/addons/webxr/XRHandModelFactory.js';
 
 const params = new URLSearchParams(location.search);
@@ -221,13 +220,40 @@ class Builder {
       g.setAttribute('color', new THREE.BufferAttribute(col, 3));
       g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
       g.computeBoundingSphere();
-      parts.push({ name: mk.name, geometry: g, rMin, rMax, zMid: (zMin + zMax) / 2 });
+      parts.push({ name: mk.name, geometry: g, rMin, rMax, zMid: (zMin + zMax) / 2, cov: coverageOf(pos) });
     });
     this.pos = this.col = null;
     return parts;
   }
 }
 let INK = 0x1c1424;
+
+// Where a ring is actually drawn, as a polar bitmap (radius × angle), so a pinch picks the ring under the finger
+// rather than any ring whose radius range happens to include that point.
+const COV_R = 64, COV_A = 256, COV_MAX = 1.05;
+const coverageOf = (pos) => {
+  const cov = new Uint8Array(COV_R * COV_A);
+  const mark = (x, y) => {
+    const r = Math.hypot(x, y); if (r >= COV_MAX) return;
+    let a = Math.atan2(y, x) / TAU; a -= Math.floor(a);
+    cov[((r / COV_MAX * COV_R) | 0) * COV_A + ((a * COV_A) | 0) % COV_A] = 1;
+  };
+  const edge = (ax, ay, bx, by) => { const n = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay) / 0.008)); for (let i = 0; i <= n; i++) mark(ax + (bx - ax) * i / n, ay + (by - ay) * i / n); };
+  for (let i = 0; i < pos.length; i += 9) {
+    const ax = pos[i], ay = pos[i + 1], bx = pos[i + 3], by = pos[i + 4], cx = pos[i + 6], cy = pos[i + 7];
+    edge(ax, ay, bx, by); edge(bx, by, cx, cy); edge(cx, cy, ax, ay); mark((ax + bx + cx) / 3, (ay + by + cy) / 3);
+  }
+  return cov;
+};
+/** Is ring-local point (r, angle) on this ring? Looks one cell around for tolerance. */
+const covers = (cov, r, a) => {
+  if (r >= COV_MAX) return false;
+  a /= TAU; a -= Math.floor(a);
+  const ri = (r / COV_MAX * COV_R) | 0, ai = (a * COV_A) | 0;
+  for (let dr = -1; dr <= 1; dr++) { const rr = ri + dr; if (rr < 0 || rr >= COV_R) continue;
+    for (let da = -1; da <= 1; da++) if (cov[rr * COV_A + ((ai + da + COV_A) % COV_A)]) return true; }
+  return false;
+};
 const samples = (n) => 2 * n * Math.ceil(900 / (2 * n));
 
 // polar profiles: tips at θ = (k + phase)·2π/n
@@ -599,6 +625,7 @@ renderer.xr.enabled = true;
 renderer.xr.setFoveation(0.4);
 document.body.appendChild(renderer.domElement);
 if (SHOT) document.body.classList.add('shot');
+const TEST = params.has('test'); // exposes window.__mm and simulated hands for automated checks
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.02, 60);
@@ -607,64 +634,146 @@ camera.position.set(0, 1.45, 1.35);
 scene.add(new THREE.AmbientLight(0xffffff, 2.85));
 const sun = new THREE.DirectionalLight(0xffffff, 0.5); sun.position.set(0.5, 1.2, 2); scene.add(sun);
 
-const holder = new THREE.Group(); holder.position.set(0, 1.45, 0); scene.add(holder);
-const spinner = new THREE.Group(); spinner.scale.setScalar(WORLD_R); holder.add(spinner);
 const material = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
-
-const EXPLODE_GAP = 0.055 / WORLD_R; // ring spacing at full explode (5.5 cm), in mandala units
-const IDQ = new THREE.Quaternion(), ZAXIS = new THREE.Vector3(0, 0, 1);
-const designs = []; // { group, rings: [{ mesh, index, rMin, rMax, zMid, home, held }] }
-const buildDesign = (i) => {
-  if (designs[i]) return designs[i];
-  const t0 = performance.now(); const b = new Builder(1234 + i * 77); DESIGNS[i].build(b);
-  const group = new THREE.Group(); group.visible = false; spinner.add(group);
-  let tris = 0;
-  const rings = b.build().map((p, index) => {
-    const mesh = new THREE.Mesh(p.geometry, material); mesh.name = p.name; group.add(mesh);
-    tris += p.geometry.attributes.position.count / 3;
-    const ring = { mesh, index, rMin: p.rMin, rMax: p.rMax, zMid: p.zMid, home: new THREE.Vector3(), homeQ: new THREE.Quaternion(), spin: 0, held: 0 };
-    mesh.userData.ring = ring; return ring;
-  });
-  designs[i] = { group, rings };
-  console.log(`${DESIGNS[i].name}: ${rings.length} rings, ${tris | 0} triangles, ${(performance.now() - t0) | 0} ms`);
-  return designs[i];
-};
-let current = -1;
-const show = (i) => {
-  i = ((i % DESIGNS.length) + DESIGNS.length) % DESIGNS.length;
-  releaseAll();
-  buildDesign(i);
-  designs.forEach((d, k) => { if (d) d.group.visible = k === i; });
-  current = i;
-  if (!inMR) scene.background = bgColor.setHex(DESIGNS[i].bg);
-  document.querySelectorAll('#ui [data-m]').forEach((el) => el.classList.toggle('on', +el.dataset.m === i));
-  pickers.forEach((p, k) => p.ring.material.color.setHex(k === i ? 0xffffff : 0x6c5a7c));
+/** Material for a copy: same shader program for every copy, each with its own hue rotation. */
+const hueMaterial = (hue) => {
+  const m = material.clone(); const uHue = { value: hue };
+  m.onBeforeCompile = (sh) => {
+    sh.uniforms.uHue = uHue;
+    sh.fragmentShader = 'uniform float uHue;\n' + sh.fragmentShader.replace('#include <color_fragment>', `#include <color_fragment>
+      { float c = cos(uHue), s = sin(uHue), k = (1.0 - c) / 3.0, q = 0.57735 * s;
+        diffuseColor.rgb = clamp(mat3(c + k, k + q, k - q, k - q, c + k, k + q, k + q, k - q, c + k) * diffuseColor.rgb, 0.0, 1.0); }`);
+  };
+  m.customProgramCacheKey = () => 'mandala-hue';
+  return m;
 };
 
-// ── exploded view + spring-back ──
+const EXPLODE_GAP = 0.055 / WORLD_R; // ring spacing when pulled apart (5.5 cm), in mandala units
+const AUTO_SPIN = 0.06;              // rad/s: every ring's slow default spin
+const IDQ = new THREE.Quaternion(), ZAXIS = new THREE.Vector3(0, 0, 1), YAXIS = new THREE.Vector3(0, 1, 0);
+const wrapA = (a) => a - TAU * Math.round(a / TAU);
+
+// ring geometry per design, built once and shared by every mandala showing that design
+const designParts = [];
+const getDesign = (i) => {
+  if (!designParts[i]) {
+    const t0 = performance.now(); const b = new Builder(1234 + i * 77); DESIGNS[i].build(b);
+    designParts[i] = b.build();
+    const tris = designParts[i].reduce((n, p) => n + p.geometry.attributes.position.count / 3, 0);
+    console.log(`${DESIGNS[i].name}: ${designParts[i].length} rings, ${tris | 0} triangles, ${(performance.now() - t0) | 0} ms`);
+  }
+  return designParts[i];
+};
+
+/** One mandala in the scene. root = where it is (grab/scale), sway = idle motion + appear animation, body = mandala units. */
+class Mandala {
+  constructor(design, mat, isCopy = false) {
+    this.root = new THREE.Group(); this.sway = new THREE.Group(); this.body = new THREE.Group();
+    this.body.scale.setScalar(WORLD_R); this.root.add(this.sway); this.sway.add(this.body); scene.add(this.root);
+    this.material = mat; this.isCopy = isCopy; this.phase = Math.random() * TAU; this.appear = isCopy ? 0 : 1;
+    if (isCopy) this.sway.scale.setScalar(0.001);
+    this.rings = []; this.design = -1; this.setDesign(design);
+  }
+  setDesign(i) {
+    if (i === this.design) return;
+    for (const r of this.rings) this.body.remove(r.mesh);
+    this.rings = getDesign(i).map((p, index) => {
+      const mesh = new THREE.Mesh(p.geometry, this.material); mesh.name = p.name; this.body.add(mesh);
+      const ring = { mesh, inst: this, index, cov: p.cov, rMin: p.rMin, rMax: p.rMax, zMid: p.zMid, home: new THREE.Vector3(), angle: 0, vel: 0, auto: 1, dragging: 0, held: 0 };
+      mesh.userData.ring = ring; return ring;
+    });
+    this.design = i;
+  }
+  dispose() { scene.remove(this.root); if (this.material !== material) this.material.dispose(); }
+}
+const mandalas = []; // [0] is the original; the rest are copies made with a double pinch
+const MAX_COPIES = 5;
+
+// ── layers: pull-apart, per-ring spin with inertia ──
 const explodeEl = document.getElementById('explode');
-let explode = 0;
-const setExplode = (v) => { explode = THREE.MathUtils.clamp(v, 0, 1); if (explodeEl) explodeEl.value = explode; };
+let explode = 0, explodeTarget = 0;
+const setExplode = (v) => { explode = explodeTarget = THREE.MathUtils.clamp(v, 0, 1); if (explodeEl) explodeEl.value = explode; };
 explodeEl.addEventListener('input', () => setExplode(+explodeEl.value));
-document.getElementById('reset').onclick = () => { resetSpins(); setExplode(0); };
-let heldCount = 0;
-/** In-plane angle of a ring's current orientation (twist about the mandala axis). */
 const twistOf = (q) => 2 * Math.atan2(q.z, q.w);
-const resetSpins = () => designs.forEach((d) => d && d.rings.forEach((r) => (r.spin = 0)));
-const updateRings = (dt) => {
-  const d = designs[current]; if (!d) return;
-  const k = 1 - Math.exp(-dt * 6); // gentle spring towards home
-  for (const r of d.rings) {
-    r.home.set(0, 0, explode * r.index * EXPLODE_GAP); r.homeQ.setFromAxisAngle(ZAXIS, r.spin);
-    if (!r.held) { r.mesh.position.lerp(r.home, k); r.mesh.quaternion.slerp(r.homeQ, k); } // back into the stack, keeping its own spin
+const resetSpins = () => { for (const r of mandalas[0].rings) { r.angle = 0; r.vel = 0; } };
+document.getElementById('reset').onclick = () => { resetSpins(); setExplode(0); };
+
+const updateMandalas = (dt, t) => {
+  explode += (explodeTarget - explode) * (1 - Math.exp(-dt * 5));
+  const k = 1 - Math.exp(-dt * 6), decay = Math.exp(-dt * 3.5); // inertia fades out over about a second
+  for (const m of mandalas) {
+    if (m.appear < 1) { // quick scale-up with a little overshoot
+      m.appear = Math.min(1, m.appear + dt / 0.35); const a = m.appear - 1, c = 1.7;
+      m.sway.scale.setScalar(Math.max(0.001, 1 + (c + 1) * a * a * a + c * a * a));
+    }
+    if (m.isCopy) { m.sway.rotation.y = 0.07 * Math.sin(t * 0.45 + m.phase); m.sway.position.y = 0.015 * Math.sin(t * 0.6 + m.phase * 1.3); }
+    for (const r of m.rings) {
+      r.home.set(0, 0, explode * r.index * EXPLODE_GAP);
+      if (r.held) continue; // desktop pull: the mouse owns this ring
+      r.mesh.position.lerp(r.home, k);
+      if (!r.dragging) {
+        if (r.vel !== 0) { r.angle += r.vel * dt; r.vel *= decay; if (Math.abs(r.vel) < 0.02) r.vel = 0; }
+        else r.auto = Math.min(1, r.auto + dt); // ease back into the slow auto-spin
+        r.angle += AUTO_SPIN * r.auto * dt;
+      }
+      r.mesh.quaternion.setFromAxisAngle(ZAXIS, r.angle);
+    }
   }
 };
 
-// ── holding a ring: it follows a pose (hand, controller or mouse point) rigidly ──
+// ── rays against mandala layers (analytic planes, no mesh raycasts per frame) ──
+const _ray = new THREE.Ray(), _inv = new THREE.Matrix4(), _pl = new THREE.Plane(), _hit = new THREE.Vector3(), _w = new THREE.Vector3();
+/** World ray → hit on the plane z = zLocal of obj's local space (written to out), or null. */
+const hitPlaneOf = (obj, ray, zLocal, out) => {
+  obj.updateWorldMatrix(true, false); _inv.copy(obj.matrixWorld).invert(); _ray.copy(ray).applyMatrix4(_inv);
+  _pl.normal.copy(ZAXIS); _pl.constant = -zLocal; return _ray.intersectPlane(_pl, out);
+};
+/** The ring drawn on top where the ray meets the mandala: checks each layer (front to back) for paint at that spot. */
+const pickRing = (m, ray) => {
+  for (let k = m.rings.length - 1; k >= 0; k--) {
+    const ring = m.rings[k];
+    if (!hitPlaneOf(m.body, ray, ring.mesh.position.z + ring.zMid, _hit)) continue;
+    // into the ring's own frame: undo its current spin
+    if (covers(ring.cov, Math.hypot(_hit.x, _hit.y), Math.atan2(_hit.y, _hit.x) - ring.angle)) return ring;
+  }
+  return null;
+};
+
+// ── rotating a ring by swiping (hands and desktop right-drag share this) ──
+const makeDrag = () => ({ ring: null, z: 0, r: 0.5, prev: 0, unwrapped: 0, smooth: 0, ringA0: 0, last: 0, vel: 0, engaged: false, arc: 0 });
+const beginDrag = (d, ring, ray) => {
+  d.z = ring.mesh.position.z + ring.zMid;
+  if (!hitPlaneOf(ring.inst.body, ray, d.z, _hit)) return false;
+  d.ring = ring; ring.dragging++; ring.auto = 0; ring.vel = 0;   // stop this layer's own spin while it's held
+  d.prev = Math.atan2(_hit.y, _hit.x); d.r = Math.max(0.05, Math.hypot(_hit.x, _hit.y));
+  d.unwrapped = d.smooth = 0; d.ringA0 = d.last = ring.angle; d.vel = 0; d.engaged = false; d.arc = 0;
+  return true;
+};
+/** moved: how far the hand has travelled (m); held: pinch time (s). Engages only once it can't be a tap. smooth: 1/s (mouse needs none). */
+const updateDrag = (d, ray, dt, moved, held, smooth = 20) => {
+  const ring = d.ring; if (!ring || !hitPlaneOf(ring.inst.body, ray, d.z, _hit)) return;
+  const metres = WORLD_R * ring.inst.root.scale.x * d.r;
+  const a = Math.atan2(_hit.y, _hit.x), step = wrapA(a - d.prev);
+  if (Math.abs(step) * metres > 0.0012) { d.unwrapped += step; d.prev = a; } // ignore sub-millimetre tracking jitter
+  d.arc = Math.abs(d.unwrapped) * metres;
+  if (!d.engaged) { if (!(moved > 0.02 || (held > 0.3 && d.arc > 0.012))) return; d.engaged = true; }
+  d.smooth += (d.unwrapped - d.smooth) * (1 - Math.exp(-dt * smooth)); // light smoothing for hand-tracking noise
+  ring.angle = d.ringA0 + d.smooth;
+  if (dt > 0) d.vel += ((ring.angle - d.last) / dt - d.vel) * 0.35;
+  d.last = ring.angle;
+};
+const endDrag = (d) => {
+  const ring = d.ring; if (!ring) return;
+  if (d.engaged) ring.vel = THREE.MathUtils.clamp(d.vel, -8, 8); // keep spinning, then settle back to auto-spin
+  else ring.angle = d.ringA0;                                      // a tap never nudges a ring
+  ring.dragging--; ring.auto = 0; d.ring = null; d.engaged = false;
+};
+
+// ── desktop: pull a ring out (left-drag) or spin it (right/shift-drag) ──
 const _hand = new THREE.Matrix4(), _loc = new THREE.Matrix4(), _one = new THREE.Vector3(1, 1, 1), _scl = new THREE.Vector3();
-const _qz = new THREE.Quaternion();
+let heldCount = 0;
 const grabRing = (g, ring, pos, quat) => {
-  g.ring = ring; g.extra = 0; ring.held++; heldCount++;
+  g.ring = ring; ring.held++; heldCount++;
   ring.mesh.updateWorldMatrix(true, false);
   _hand.compose(pos, quat, _one).invert(); g.off.multiplyMatrices(_hand, ring.mesh.matrixWorld);
 };
@@ -673,18 +782,13 @@ const moveRing = (g, pos, quat) => {
   _hand.compose(pos, quat, _one).multiply(g.off);
   _loc.copy(mesh.parent.matrixWorld).invert().multiply(_hand);
   _loc.decompose(mesh.position, mesh.quaternion, _scl);
-  if (g.extra) mesh.quaternion.multiply(_qz.setFromAxisAngle(ZAXIS, g.extra)); // thumbstick spin about the ring's own axis
 };
-const dropRing = (g) => { if (!g.ring) return; g.ring.spin = twistOf(g.ring.mesh.quaternion); g.extra = 0; g.ring.held--; heldCount--; g.ring = null; };
-const releaseAll = () => {
-  if (typeof hands !== 'undefined') hands.forEach((h) => { if (h.mode === 2) dropRing(h.rg); h.mode = 0; });
-  if (typeof mouseGrab !== 'undefined' && mouseGrab.ring) { dropRing(mouseGrab); controls.enabled = true; }
-  grabMode = 0;
-};
+const dropRing = (g) => { if (!g.ring) return; g.ring.angle = twistOf(g.ring.mesh.quaternion); g.ring.held--; heldCount--; g.ring = null; };
+
 const bgColor = new THREE.Color();
 let inMR = false;
 
-// in-world switcher: four small swatches below the mandala (poke with a finger or controller)
+// in-world switcher: four small swatches below the mandala (poke with a fingertip)
 const pickerGroup = new THREE.Group(); scene.add(pickerGroup);
 const swatches = [0x8a43ab, 0x9c1f2f, 0x1f6f46, 0xea920f];
 const pickers = swatches.map((hex, i) => {
@@ -695,46 +799,46 @@ const pickers = swatches.map((hex, i) => {
 });
 pickerGroup.visible = false;
 
+let current = -1;
+const show = (i) => {
+  i = ((i % DESIGNS.length) + DESIGNS.length) % DESIGNS.length;
+  cancelAll();
+  mandalas[0].setDesign(i);
+  current = i;
+  if (!inMR) scene.background = bgColor.setHex(DESIGNS[i].bg);
+  document.querySelectorAll('#ui [data-m]').forEach((el) => el.classList.toggle('on', +el.dataset.m === i));
+  pickers.forEach((p, k) => p.ring.material.color.setHex(k === i ? 0xffffff : 0x6c5a7c));
+};
+
 // desktop controls
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 1.45, 0); controls.enableDamping = true; controls.minDistance = 0.35; controls.maxDistance = 4; controls.update();
 
-// desktop ring dragging: press on a ring to pull it out (moves in a plane facing the camera); empty space orbits
 const raycaster = new THREE.Raycaster(), ndc = new THREE.Vector2(), dragPlane = new THREE.Plane(), dragPoint = new THREE.Vector3(), camDir = new THREE.Vector3();
-const mouseGrab = { ring: null, off: new THREE.Matrix4(), extra: 0, spinning: false, a0: 0, spin0: 0 };
-const spinLocal = new THREE.Vector3();
+const mouseGrab = { ring: null, off: new THREE.Matrix4() };
+const mouseSpin = makeDrag();
 const setNdc = (e) => { const r = renderer.domElement.getBoundingClientRect(); ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1); };
 renderer.domElement.addEventListener('pointerdown', (e) => {
-  if (renderer.xr.isPresenting || (e.button !== 0 && e.button !== 2) || !designs[current]) return;
-  setNdc(e); raycaster.setFromCamera(ndc, camera); designs[current].group.updateWorldMatrix(true, true);
-  const hit = raycaster.intersectObjects(designs[current].group.children, false)[0];
+  if (renderer.xr.isPresenting || (e.button !== 0 && e.button !== 2)) return;
+  const main = mandalas[0];
+  setNdc(e); raycaster.setFromCamera(ndc, camera); main.root.updateWorldMatrix(true, true);
+  const hit = raycaster.intersectObjects(main.body.children, false)[0];
   if (!hit) return;
   controls.enabled = false; // runs before OrbitControls' own handler, so it won't orbit
   const ring = hit.object.userData.ring;
-  if (e.shiftKey || e.button === 2) {
-    // spin: turn the ring around the mandala's centre, in its own plane
-    const grp = designs[current].group; camDir.set(0, 0, 1).transformDirection(grp.matrixWorld);
-    dragPlane.setFromNormalAndCoplanarPoint(camDir, hit.point);
-    spinLocal.copy(hit.point); grp.worldToLocal(spinLocal);
-    mouseGrab.spinning = true; mouseGrab.a0 = Math.atan2(spinLocal.y, spinLocal.x); mouseGrab.spin0 = twistOf(ring.mesh.quaternion);
-    mouseGrab.ring = ring; mouseGrab.extra = 0; ring.held++; heldCount++;
-  } else {
-    mouseGrab.spinning = false;
-    dragPlane.setFromNormalAndCoplanarPoint(camera.getWorldDirection(camDir).negate(), hit.point);
-    grabRing(mouseGrab, ring, hit.point, IDQ);
-  }
+  if (e.shiftKey || e.button === 2) beginDrag(mouseSpin, ring, raycaster.ray);
+  else { dragPlane.setFromNormalAndCoplanarPoint(camera.getWorldDirection(camDir).negate(), hit.point); grabRing(mouseGrab, ring, hit.point, IDQ); }
   renderer.domElement.setPointerCapture(e.pointerId);
 }, { capture: true });
+let lastMove = 0;
 renderer.domElement.addEventListener('pointermove', (e) => {
-  if (!mouseGrab.ring) return;
+  if (!mouseGrab.ring && !mouseSpin.ring) return;
   setNdc(e); raycaster.setFromCamera(ndc, camera);
-  if (!raycaster.ray.intersectPlane(dragPlane, dragPoint)) return;
-  if (mouseGrab.spinning) {
-    spinLocal.copy(dragPoint); designs[current].group.worldToLocal(spinLocal);
-    mouseGrab.ring.mesh.quaternion.setFromAxisAngle(ZAXIS, mouseGrab.spin0 + Math.atan2(spinLocal.y, spinLocal.x) - mouseGrab.a0);
-  } else moveRing(mouseGrab, dragPoint, IDQ);
+  const now = performance.now() / 1000, dt = Math.min(0.1, now - lastMove || 0.016); lastMove = now;
+  if (mouseSpin.ring) updateDrag(mouseSpin, raycaster.ray, dt, 1, 1, 1e4);
+  else if (raycaster.ray.intersectPlane(dragPlane, dragPoint)) moveRing(mouseGrab, dragPoint, IDQ);
 });
-const endMouse = () => { if (!mouseGrab.ring) return; dropRing(mouseGrab); controls.enabled = true; };
+const endMouse = () => { if (mouseSpin.ring) endDrag(mouseSpin); if (mouseGrab.ring) dropRing(mouseGrab); controls.enabled = true; };
 renderer.domElement.addEventListener('pointerup', endMouse);
 renderer.domElement.addEventListener('pointercancel', endMouse);
 renderer.domElement.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -746,128 +850,245 @@ if (SHOT) {
   renderer.setPixelRatio(1); renderer.setSize(+params.get('size') || 900, +params.get('size') || 900);
 }
 
-// ───────────────────────── XR interaction ─────────────────────────
-const ctlFactory = new XRControllerModelFactory();
+// ───────────────────────── VR panel ─────────────────────────
+// Rounded dark-glass panel with three big buttons (12 × 8 cm) and a hint line. Canvases redraw only when a state changes.
+const PANEL_W = 0.44, PANEL_H = 0.25, BTN_W = 0.12, BTN_H = 0.08;
+const canvasPlane = (w, h, px) => {
+  const cv = document.createElement('canvas'); cv.width = px; cv.height = Math.round(px * h / w);
+  const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 4;
+  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false }));
+  mesh.renderOrder = 5; return { cv, ctx: cv.getContext('2d'), tex, mesh };
+};
+const panel = new THREE.Group(); panel.visible = false; scene.add(panel);
+{
+  const bg = canvasPlane(PANEL_W, PANEL_H, 1024), c = bg.ctx, W = bg.cv.width, H = bg.cv.height;
+  c.fillStyle = 'rgba(26, 14, 40, 0.82)'; c.beginPath(); c.roundRect(4, 4, W - 8, H - 8, 56); c.fill();
+  c.strokeStyle = 'rgba(255, 255, 255, 0.22)'; c.lineWidth = 5; c.stroke();
+  c.fillStyle = 'rgba(244, 236, 255, 0.92)'; c.font = '600 52px system-ui, sans-serif'; c.textBaseline = 'middle'; c.fillText('Mandala Madness', 48, 74);
+  bg.tex.needsUpdate = true; panel.add(bg.mesh);
+}
+const buttons = [
+  { id: 'exit', label: 'Exit', x: -0.14 },
+  { id: 'apart', label: 'Pull apart', x: 0 },
+  { id: 'clear', label: 'Clear copies', x: 0.14 },
+].map((def) => {
+  const p = canvasPlane(BTN_W, BTN_H, 384); p.mesh.position.set(def.x, 0.005, 0.004); p.mesh.renderOrder = 6; panel.add(p.mesh);
+  return { ...def, y: 0.005, p, hover: 0, on: false, press: 0, key: '' };
+});
+const drawButton = (b) => {
+  const key = `${b.hover > 0}|${b.on}`; if (key === b.key) return; b.key = key;
+  const c = b.p.ctx, W = b.p.cv.width, H = b.p.cv.height;
+  c.clearRect(0, 0, W, H);
+  c.fillStyle = b.on ? 'rgba(140, 69, 173, 0.95)' : b.hover > 0 ? 'rgba(170, 120, 255, 0.45)' : 'rgba(255, 255, 255, 0.10)';
+  c.beginPath(); c.roundRect(6, 6, W - 12, H - 12, 40); c.fill();
+  c.strokeStyle = b.hover > 0 ? 'rgba(255, 255, 255, 0.95)' : 'rgba(255, 255, 255, 0.30)'; c.lineWidth = b.hover > 0 ? 10 : 5; c.stroke();
+  c.fillStyle = '#fff'; c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.font = `700 ${b.label.length > 8 ? 46 : 60}px system-ui, sans-serif`; c.fillText(b.label, W / 2, H / 2 + 2);
+  b.p.tex.needsUpdate = true;
+};
+buttons.forEach(drawButton);
+const hintPlane = canvasPlane(0.4, 0.05, 1024); hintPlane.mesh.position.set(0, -0.085, 0.003); panel.add(hintPlane.mesh);
+const HINT = 'Pinch + swipe a ring to rotate · double pinch to duplicate';
+let hintText = '', sessionT = 0, msgUntil = 0, msgText = '';
+const drawHint = (text) => {
+  if (text === hintText) return; hintText = text;
+  const c = hintPlane.ctx, W = hintPlane.cv.width, H = hintPlane.cv.height;
+  c.clearRect(0, 0, W, H); c.fillStyle = 'rgba(244, 236, 255, 0.95)'; c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.font = '500 40px system-ui, sans-serif'; c.fillText(text, W / 2, H / 2); hintPlane.tex.needsUpdate = true;
+};
+/** Brief message in the hint line (e.g. the copy limit). */
+const flash = (text, secs = 2.5) => { msgText = text; msgUntil = sessionT + secs; };
+const updatePanel = (dt) => {
+  sessionT += dt;
+  let op;
+  if (sessionT < msgUntil) { drawHint(msgText); op = 1; }
+  else { drawHint(HINT); op = THREE.MathUtils.clamp(11 - sessionT, 0, 1); } // the hint fades out after 10 s
+  hintPlane.mesh.material.opacity = op; hintPlane.mesh.visible = op > 0.01;
+  for (const b of buttons) {
+    b.hover = 0; for (const h of hands) if (h.aimBtn === b) b.hover++;
+    b.on = b.id === 'apart' && explodeTarget > 0.5;
+    drawButton(b);
+    if (b.press > 0) b.press = Math.max(0, b.press - dt);
+    b.p.mesh.scale.setScalar(1 - 0.12 * Math.sin(Math.PI * (b.press / 0.2)));
+  }
+};
+const pressButton = (b) => {
+  b.press = 0.2;
+  if (b.id === 'exit') { const s = renderer.xr.getSession(); if (s) s.end(); }
+  else if (b.id === 'apart') explodeTarget = explodeTarget > 0.5 ? 0 : 1;
+  else if (b.id === 'clear') { if (mandalas.length > 1) { clearCopies(); flash('Copies cleared'); } else flash('No copies yet: double pinch a mandala'); }
+};
+
+// ───────────────────────── copies ─────────────────────────
+const HUES = [0.09, -0.09, 0.18, -0.18, 0.27], LIFTS = [0.12, -0.08, 0.2, -0.16, 0.05];
+const _head = new THREE.Vector3(), _fwd = new THREE.Vector3(), _dir = new THREE.Vector3();
+const headPose = () => { // world position + horizontal facing of the viewer
+  const cam = renderer.xr.isPresenting ? renderer.xr.getCamera() : camera;
+  cam.updateMatrixWorld(); _head.setFromMatrixPosition(cam.matrixWorld);
+  _fwd.set(0, 0, -1).transformDirection(cam.matrixWorld); _fwd.y = 0; if (_fwd.lengthSq() < 1e-6) _fwd.set(0, 0, -1); _fwd.normalize();
+};
+/** Copies go in an arc ~2 m around you, alternating left and right of the original, at varied heights. */
+const duplicate = (src) => {
+  if (mandalas.length > MAX_COPIES) { flash(`Limit reached: ${MAX_COPIES} copies. Use Clear copies to start again.`); return; }
+  const n = mandalas.length, side = n % 2 ? 1 : -1, step = Math.ceil(n / 2);
+  headPose();
+  _dir.subVectors(mandalas[0].root.position, _head); _dir.y = 0; if (_dir.lengthSq() < 1e-6) _dir.copy(_fwd); _dir.normalize();
+  _dir.applyAxisAngle(YAXIS, side * step * 0.6);
+  const m = new Mandala(src.design, hueMaterial(HUES[n - 1]), true);
+  m.root.position.copy(_head).addScaledVector(_dir, 2.0); m.root.position.y = mandalas[0].root.position.y + LIFTS[n - 1];
+  m.root.lookAt(_head); // +z (the drawn face) towards you
+  m.rings.forEach((r, k) => { r.angle = src.rings[k].angle; });
+  mandalas.push(m);
+  flash(`Copy ${n} of ${MAX_COPIES}`, 1.5);
+};
+const clearCopies = () => { cancelAll(); while (mandalas.length > 1) mandalas.pop().dispose(); };
+
+// ───────────────────────── hands ─────────────────────────
 const handFactory = new XRHandModelFactory();
+const rayGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -1)]);
+const rayMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.35 });
+const dotGeo = new THREE.CircleGeometry(0.007, 20);
+const J_THUMB = 'thumb-tip', J_INDEX = 'index-finger-tip';
 const hands = [0, 1].map((i) => {
-  const ctl = renderer.xr.getController(i), grip = renderer.xr.getControllerGrip(i), hand = renderer.xr.getHand(i);
-  grip.add(ctlFactory.createControllerModel(grip)); hand.add(handFactory.createHandModel(hand, 'mesh'));
-  scene.add(ctl, grip, hand);
-  // mode: 0 idle, 1 holding the whole mandala, 2 holding one ring
-  const h = { i, ctl, grip, hand, isHand: false, src: null, mode: 0, rg: { ring: null, off: new THREE.Matrix4(), extra: 0 }, pos: new THREE.Vector3(), quat: new THREE.Quaternion(), poke: new THREE.Vector3(), axisLatch: false, btnLatch: false, resetLatch: false };
+  const ctl = renderer.xr.getController(i), hand = renderer.xr.getHand(i);
+  hand.add(handFactory.createHandModel(hand, 'spheres')); // simple joint spheres, no download needed
+  const line = new THREE.Line(rayGeo, rayMat); line.scale.z = 0.5; ctl.add(line);
+  const dot = new THREE.Mesh(dotGeo, new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9, depthTest: false }));
+  dot.renderOrder = 10; dot.visible = false; scene.add(ctl, hand, dot);
+  const h = {
+    i, ctl, hand, line, dot, src: null, isHand: false, live: false,
+    ray: new THREE.Ray(), pinch: new THREE.Vector3(), poke: new THREE.Vector3(), start: new THREE.Vector3(),
+    aimType: null, aimInst: null, aimBtn: null, aimDist: 0, aimPoint: new THREE.Vector3(),
+    pinching: false, t0: 0, mode: 'none', target: null, drag: makeDrag(), lastTap: -10, lastTapInst: null,
+  };
   ctl.addEventListener('connected', (e) => { h.src = e.data; h.isHand = !!e.data.hand; });
-  ctl.addEventListener('disconnected', () => { endGrab(h); h.src = null; });
-  ctl.addEventListener('selectstart', () => beginGrab(h, false));  // trigger / pinch: a ring if you're touching one
-  ctl.addEventListener('squeezestart', () => beginGrab(h, true));  // grip: always the whole mandala
-  ctl.addEventListener('selectend', () => endGrab(h)); ctl.addEventListener('squeezeend', () => endGrab(h));
+  ctl.addEventListener('disconnected', () => { pinchEnd(h); h.src = null; });
+  ctl.addEventListener('selectstart', () => pinchStart(h)); // fires on pinch with hand tracking
+  ctl.addEventListener('selectend', () => pinchEnd(h));
   return h;
 });
+const xrActive = () => renderer.xr.isPresenting || TEST;
+let clockT = 0; // seconds, advanced by the frame loop
 
-// preallocated temporaries — nothing is allocated per frame
-const tA = new THREE.Vector3(), tB = new THREE.Vector3(), tC = new THREE.Vector3(), tQ = new THREE.Quaternion(), tQ2 = new THREE.Quaternion();
-const g1 = { hPos: new THREE.Vector3(), hQuatInv: new THREE.Quaternion(), oPos: new THREE.Vector3(), oQuat: new THREE.Quaternion() };
-const g2 = { dist: 1, scale: 1, e0: 0, axis: new THREE.Vector3(), normal: new THREE.Vector3(), mid: new THREE.Vector3(), oPos: new THREE.Vector3(), oQuat: new THREE.Quaternion() };
-let grabMode = 0; // whole-mandala grab: 0 none, 1 one hand, 2 two hands
-const whole = []; // reused list of hands holding the whole mandala
-const J_THUMB = 'thumb-tip', J_INDEX = 'index-finger-tip', J_WRIST = 'wrist';
-const TOUCH = 0.06; // metres: how close to a layer counts as touching it
-
-const readPose = (h) => {
-  if (h.isHand) {
-    const j = h.hand.joints, th = j[J_THUMB], ix = j[J_INDEX], wr = j[J_WRIST];
-    if (!th || !ix || !wr) return false;
-    h.pos.copy(th.position).add(ix.position).multiplyScalar(0.5); h.quat.copy(wr.quaternion); h.poke.copy(ix.position);
-  } else { h.grip.getWorldPosition(h.pos); h.grip.getWorldQuaternion(h.quat); h.poke.copy(h.pos); }
-  return true;
+const readHand = (h) => {
+  if (TEST) return h.live; // simulated hands set ray / pinch directly
+  const ctl = h.ctl; ctl.updateMatrixWorld(true);
+  h.live = !!h.src && ctl.visible;
+  h.ray.origin.setFromMatrixPosition(ctl.matrixWorld); h.ray.direction.set(0, 0, -1).transformDirection(ctl.matrixWorld);
+  const j = h.hand.joints, th = j && j[J_THUMB], ix = j && j[J_INDEX];
+  if (h.isHand && th && ix && ix.visible) { h.pinch.copy(th.position).add(ix.position).multiplyScalar(0.5); h.poke.copy(ix.position); }
+  else { h.pinch.copy(h.ray.origin); h.poke.copy(h.ray.origin); }
+  return h.live;
 };
-/** The ring under the hand: inside its radial band and nearest in depth (exploded layers are easy to single out). */
-const pickRing = (pos) => {
-  const d = designs[current]; if (!d) return null;
-  d.group.updateWorldMatrix(true, false); tA.copy(pos); d.group.worldToLocal(tA);
-  const r = Math.hypot(tA.x, tA.y); if (r > 1.05) return null;
-  let best = null, bestDz = TOUCH / (WORLD_R * holder.scale.x);
-  for (let k = d.rings.length - 1; k >= 0; k--) {
-    const ring = d.rings[k]; if (r < ring.rMin - 0.02 || r > ring.rMax + 0.02) continue;
-    const dz = Math.abs(tA.z - (ring.mesh.position.z + ring.zMid)); if (dz < bestDz - 1e-4) { best = ring; bestDz = dz; }
+/** What the hand's ray points at first: a panel button, the panel, or a mandala. */
+const aim = (h) => {
+  h.aimType = null; h.aimInst = null; h.aimBtn = null; h.aimDist = Infinity;
+  if (panel.visible && hitPlaneOf(panel, h.ray, 0, _hit) && Math.abs(_hit.x) < PANEL_W / 2 && Math.abs(_hit.y) < PANEL_H / 2) {
+    _w.copy(_hit).applyMatrix4(panel.matrixWorld); h.aimDist = _w.distanceTo(h.ray.origin); h.aimPoint.copy(_w); h.aimType = 'panel';
+    for (const b of buttons) if (Math.abs(_hit.x - b.x) < BTN_W / 2 && Math.abs(_hit.y - b.y) < BTN_H / 2) { h.aimBtn = b; h.aimType = 'button'; }
   }
-  return best;
-};
-const collectWhole = () => { whole.length = 0; for (const h of hands) if (h.mode === 1) whole.push(h); return whole; };
-const startOne = (h) => { readPose(h); g1.hPos.copy(h.pos); g1.hQuatInv.copy(h.quat).invert(); g1.oPos.copy(holder.position); g1.oQuat.copy(holder.quaternion); grabMode = 1; };
-const startTwo = (a, c) => {
-  readPose(a); readPose(c); g2.dist = Math.max(0.02, a.pos.distanceTo(c.pos)); g2.scale = holder.scale.x; g2.e0 = explode;
-  g2.axis.subVectors(c.pos, a.pos).normalize(); g2.mid.addVectors(a.pos, c.pos).multiplyScalar(0.5);
-  g2.normal.set(0, 0, 1).applyQuaternion(holder.quaternion); g2.oPos.copy(holder.position); g2.oQuat.copy(holder.quaternion); grabMode = 2;
-};
-const restartWhole = () => { const w = collectWhole(); if (w.length >= 2) startTwo(w[0], w[1]); else if (w.length === 1) startOne(w[0]); else grabMode = 0; };
-function beginGrab(h, wholeOnly) {
-  if (h.mode || (pokeCooldown > 0 && h.isHand) || !readPose(h)) return;
-  const ring = wholeOnly ? null : pickRing(h.pos);
-  if (ring) { h.mode = 2; grabRing(h.rg, ring, h.pos, h.quat); return; }
-  h.mode = 1; restartWhole();
-}
-function endGrab(h) {
-  if (h.mode === 2) { dropRing(h.rg); h.mode = 0; return; }
-  if (h.mode === 1) { h.mode = 0; restartWhole(); }
-}
-
-const updateGrab = () => {
-  for (const h of hands) if (h.mode === 2 && readPose(h)) moveRing(h.rg, h.pos, h.quat);
-  const w = collectWhole();
-  if (grabMode === 1 && w.length === 1) {
-    const h = w[0]; if (!readPose(h)) return;
-    tQ.multiplyQuaternions(h.quat, g1.hQuatInv);                       // hand rotation since grab
-    holder.quaternion.multiplyQuaternions(tQ, g1.oQuat);
-    tA.subVectors(g1.oPos, g1.hPos).applyQuaternion(tQ); holder.position.addVectors(h.pos, tA);
-  } else if (grabMode === 2 && w.length >= 2) {
-    const a = w[0], c = w[1]; if (!readPose(a) || !readPose(c)) return;
-    const s = THREE.MathUtils.clamp(g2.scale * a.pos.distanceTo(c.pos) / g2.dist, 0.25, 4);
-    tB.subVectors(c.pos, a.pos).normalize(); tQ2.setFromUnitVectors(g2.axis, tB);
-    holder.quaternion.multiplyQuaternions(tQ2, g2.oQuat); holder.scale.setScalar(s);
-    // pulling both hands towards you (along the mandala's facing) explodes the layers instead of moving it
-    tA.addVectors(a.pos, c.pos).multiplyScalar(0.5);
-    const along = tC.subVectors(tA, g2.mid).dot(g2.normal);
-    setExplode(g2.e0 + along / 0.25);
-    tA.addScaledVector(g2.normal, -along);
-    tB.subVectors(g2.oPos, g2.mid).applyQuaternion(tQ2).multiplyScalar(s / g2.scale); holder.position.addVectors(tA, tB);
+  for (const m of mandalas) {
+    if (!hitPlaneOf(m.body, h.ray, 0, _hit) || Math.hypot(_hit.x, _hit.y) > 1.02) continue;
+    _w.copy(_hit).applyMatrix4(m.body.matrixWorld); const d = _w.distanceTo(h.ray.origin);
+    if (d < h.aimDist) { h.aimDist = d; h.aimPoint.copy(_w); h.aimType = 'mandala'; h.aimInst = m; h.aimBtn = null; }
   }
 };
+
+// two-hand pinch (both within 250 ms): move, turn and scale the mandala you point at
+const g2 = { m: null, a: null, c: null, dist: 1, scale: 1, axis: new THREE.Vector3(), mid: new THREE.Vector3(), oPos: new THREE.Vector3(), oQuat: new THREE.Quaternion() };
+const tA = new THREE.Vector3(), tB = new THREE.Vector3(), tQ2 = new THREE.Quaternion();
+const startTwo = (a, c, m) => {
+  for (const h of [a, c]) { if (h.drag.ring) { h.drag.engaged = false; endDrag(h.drag); } h.mode = 'two'; }
+  g2.m = m; g2.a = a; g2.c = c; g2.dist = Math.max(0.02, a.pinch.distanceTo(c.pinch)); g2.scale = m.root.scale.x;
+  g2.axis.subVectors(c.pinch, a.pinch).normalize(); g2.mid.addVectors(a.pinch, c.pinch).multiplyScalar(0.5);
+  g2.oPos.copy(m.root.position); g2.oQuat.copy(m.root.quaternion);
+};
+const updateTwo = () => {
+  const { m, a, c } = g2; if (!m) return;
+  const s = THREE.MathUtils.clamp(g2.scale * a.pinch.distanceTo(c.pinch) / g2.dist, 0.25, 4);
+  tB.subVectors(c.pinch, a.pinch).normalize(); tQ2.setFromUnitVectors(g2.axis, tB);
+  m.root.quaternion.multiplyQuaternions(tQ2, g2.oQuat); m.root.scale.setScalar(s);
+  tA.addVectors(a.pinch, c.pinch).multiplyScalar(0.5);
+  tB.subVectors(g2.oPos, g2.mid).applyQuaternion(tQ2).multiplyScalar(s / g2.scale); m.root.position.addVectors(tA, tB);
+};
+
+function pinchStart(h) {
+  if (!xrActive() || h.pinching) return;
+  readHand(h); aim(h);
+  h.pinching = true; h.t0 = clockT; h.start.copy(h.pinch); h.mode = 'idle'; h.target = null;
+  if (h.aimType === 'button') { h.mode = 'panel'; pressButton(h.aimBtn); return; }
+  if (h.aimType !== 'mandala') return;
+  h.target = h.aimInst;
+  const o = hands[1 - h.i];
+  if (o.pinching && o.mode !== 'panel' && o.mode !== 'two' && clockT - o.t0 < 0.25) { startTwo(o, h, o.target || h.target); return; }
+  const ring = pickRing(h.target, h.ray);
+  if (ring && beginDrag(h.drag, ring, h.ray)) h.mode = 'drag';
+}
+function pinchEnd(h) {
+  if (!h.pinching) return;
+  h.pinching = false;
+  const dur = clockT - h.t0, moved = h.pinch.distanceTo(h.start);
+  if (h.mode === 'two') { const o = g2.a === h ? g2.c : g2.a; g2.m = null; if (o) o.mode = 'idle'; h.mode = 'none'; return; }
+  const engaged = h.drag.engaged; if (h.drag.ring) endDrag(h.drag);
+  // a short, still pinch on a mandala is a tap; two taps within 400 ms duplicate it
+  if (h.mode !== 'panel' && h.target && !engaged && dur < 0.3 && moved < 0.02) {
+    if (clockT - h.lastTap < 0.4 && h.lastTapInst === h.target) { duplicate(h.target); h.lastTap = -10; h.lastTapInst = null; }
+    else { h.lastTap = clockT; h.lastTapInst = h.target; }
+  }
+  h.mode = 'none'; h.target = null;
+}
+function cancelAll() {
+  for (const h of hands) { if (h.drag.ring) { h.drag.engaged = false; endDrag(h.drag); } h.mode = 'none'; h.target = null; h.pinching = false; h.lastTapInst = null; }
+  g2.m = null;
+  if (mouseSpin.ring) endDrag(mouseSpin);
+  if (mouseGrab.ring) { dropRing(mouseGrab); controls.enabled = true; }
+}
 
 let pokeCooldown = 0;
-const updatePickers = (dt) => {
+const updateHands = (dt) => {
   pokeCooldown = Math.max(0, pokeCooldown - dt);
   for (const h of hands) {
-    if (!h.src) continue;
-    if (h.mode === 0 && readPose(h) && pokeCooldown === 0) {
+    if (!readHand(h)) { h.dot.visible = false; h.aimBtn = null; continue; }
+    aim(h);
+    // pointer visuals: ray to whatever you point at, plus a dot there
+    h.line.scale.z = h.aimType ? Math.max(0.02, h.aimDist) : 0.5;
+    h.dot.visible = !!h.aimType;
+    if (h.aimType) { h.dot.position.copy(h.aimPoint); h.dot.lookAt(h.ray.origin); h.dot.scale.setScalar(h.pinching ? 0.7 : 1); }
+    if (h.pinching && h.mode === 'drag') updateDrag(h.drag, h.ray, dt, h.pinch.distanceTo(h.start), clockT - h.t0);
+    // poke a swatch with a fingertip to switch designs
+    if (!h.pinching && pickerGroup.visible && pokeCooldown === 0) {
       for (let k = 0; k < pickers.length; k++) { pickers[k].g.getWorldPosition(tA); if (tA.distanceTo(h.poke) < 0.045) { show(k); pokeCooldown = 0.6; break; } }
     }
-    const gp = h.src.gamepad; if (!gp) continue;
-    const x = gp.axes.length > 2 ? gp.axes[2] : 0, y = gp.axes.length > 3 ? gp.axes[3] : 0;
-    const reset = gp.buttons[5] && gp.buttons[5].pressed;
-    if (reset && !h.resetLatch) resetSpins(); h.resetLatch = !!reset;
-    if (h.mode === 2) { if (Math.abs(x) > 0.15) h.rg.extra -= x * dt * 2.5; continue; } // holding a ring: stick spins it
-    if (Math.abs(x) > 0.7 && !h.axisLatch) { h.axisLatch = true; show(current + (x > 0 ? 1 : -1)); } else if (Math.abs(x) < 0.3) h.axisLatch = false;
-    if (Math.abs(y) > 0.2 && Math.abs(x) < 0.5) setExplode(explode - y * dt * 0.8); // stick forward = explode
-    const btn = gp.buttons[4] && gp.buttons[4].pressed;
-    if (btn && !h.btnLatch) show(current + 1); h.btnLatch = !!btn;
   }
+  if (g2.m) updateTwo();
 };
 
-// sessions
+// ───────────────────────── sessions ─────────────────────────
+let placeFrames = -1;
+/** Puts the mandala ~0.9 m in front of you, the panel low on the left at chest height, swatches below. */
 const placeForXR = () => {
-  holder.position.set(0, 1.35, -0.85); holder.quaternion.identity(); holder.scale.setScalar(1);
-  pickerGroup.position.set(0, 1.35 - WORLD_R - 0.12, -0.75); pickerGroup.rotation.x = -0.35; pickerGroup.visible = true;
+  headPose();
+  const main = mandalas[0].root; main.scale.setScalar(1); main.quaternion.identity();
+  main.position.copy(_head).addScaledVector(_fwd, 0.9); main.position.y = _head.y - 0.1; main.lookAt(_head.x, main.position.y, _head.z);
+  _dir.set(-_fwd.z, 0, _fwd.x); // to your right
+  panel.position.copy(_head).addScaledVector(_fwd, 0.6).addScaledVector(_dir, -0.42); panel.position.y = _head.y - 0.42;
+  panel.lookAt(_head); panel.visible = true;
+  pickerGroup.position.copy(main.position).addScaledVector(_fwd, -0.1); pickerGroup.position.y -= WORLD_R + 0.12;
+  pickerGroup.lookAt(_head); pickerGroup.visible = true;
 };
 const startSession = async (mode) => {
+  // sessionInit: hand tracking + floor-level reference space
   const session = await navigator.xr.requestSession(mode, { requiredFeatures: ['local-floor'], optionalFeatures: ['hand-tracking', 'bounded-floor', 'layers'] });
   inMR = mode === 'immersive-ar';
   scene.background = inMR ? null : bgColor.setHex(DESIGNS[current].bg);
   renderer.xr.setReferenceSpaceType('local-floor');
   await renderer.xr.setSession(session);
-  placeForXR();
+  sessionT = 0; msgUntil = 0; placeFrames = 0; // place once the headset pose is known
   session.addEventListener('end', () => {
-    inMR = false; pickerGroup.visible = false; releaseAll();
-    holder.position.set(0, 1.45, 0); holder.quaternion.identity(); holder.scale.setScalar(1);
+    inMR = false; panel.visible = false; pickerGroup.visible = false; placeFrames = -1;
+    clearCopies();
+    const main = mandalas[0].root; main.position.set(0, 1.45, 0); main.quaternion.identity(); main.scale.setScalar(1);
+    for (const h of hands) h.dot.visible = false;
     scene.background = bgColor.setHex(DESIGNS[current].bg);
   });
 };
@@ -884,23 +1105,30 @@ addEventListener('keydown', (e) => { if (e.key >= '1' && e.key <= '4') show(+e.k
 addEventListener('resize', () => { if (SHOT) return; camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 
 // ───────────────────────── go ─────────────────────────
+mandalas.push(new Mandala(+(params.get('m') || 0), material));
+mandalas[0].root.position.set(0, 1.45, 0);
 show(+(params.get('m') || 0));
 if (SHOT) {
   scene.background = new THREE.Color(0xffffff);
+  mandalas[0].root.updateWorldMatrix(true, true);
   renderer.render(scene, shotCam);
   document.title = 'ready';
 } else {
   // build the other designs in the background so switching is instant later
-  let next = 0; const idle = () => { while (next < DESIGNS.length && designs[next]) next++; if (next < DESIGNS.length) { buildDesign(next); setTimeout(idle, 30); } };
+  let next = 0; const idle = () => { while (next < DESIGNS.length && designParts[next]) next++; if (next < DESIGNS.length) { getDesign(next); setTimeout(idle, 30); } };
   setTimeout(idle, 300);
   const clock = new THREE.Clock();
   const tick = (dt) => {
-    if (renderer.xr.isPresenting) { updateGrab(); updatePickers(dt); } else controls.update();
-    if (grabMode === 0 && heldCount === 0) spinner.rotation.z += dt * 0.06;
-    updateRings(dt);
+    clockT += dt;
+    if (xrActive()) {
+      if (placeFrames >= 0 && ++placeFrames === 3) placeForXR();
+      updateHands(dt); updatePanel(dt);
+    } else controls.update();
+    updateMandalas(dt, clockT);
     renderer.render(scene, camera);
   };
   renderer.setAnimationLoop(() => tick(Math.min(0.05, clock.getDelta())));
+  if (TEST) window.__mm = { THREE, camera, hands, mandalas, buttons, panel, tick, pinchStart, pinchEnd, placeForXR, get explode() { return explode; }, get explodeTarget() { return explodeTarget; }, get hint() { return [hintText, hintPlane.mesh.material.opacity]; }, renderer };
 }
 </script>
 <script>

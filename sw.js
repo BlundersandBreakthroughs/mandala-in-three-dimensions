@@ -3,7 +3,7 @@
 // Every entry is resolved against this worker's own location, so the cache holds
 // full sub-path URLs (…/mandala-in-three-dimensions/index.html), never domain-root ones.
 // Bump VERSION whenever any cached file changes.
-const VERSION = 'mandala-v2';
+const VERSION = 'mandala-v3';
 const BASE = new URL('./', self.location.href); // …/mandala-in-three-dimensions/
 const FILES = [
   './',
@@ -42,10 +42,20 @@ self.addEventListener('fetch', (event) => {
   const req = event.request;
   // only handle GETs inside this project's sub-path; other repos on the same origin are left alone
   if (req.method !== 'GET' || !req.url.startsWith(BASE.href)) return;
+  if (req.mode === 'navigate') {
+    // the page itself: network first, so a new version shows up on the next visit; cached copy when offline
+    event.respondWith(
+      fetch(req).then((res) => {
+        if (res.ok) { const copy = res.clone(); caches.open(VERSION).then((c) => c.put(INDEX, copy)); }
+        return res;
+      }).catch(() => caches.match(INDEX)),
+    );
+    return;
+  }
   event.respondWith(
-    caches.match(req, { ignoreSearch: req.mode === 'navigate' }).then((hit) => hit || fetch(req).then((res) => {
+    caches.match(req).then((hit) => hit || fetch(req).then((res) => {
       if (res.ok && res.type === 'basic') { const copy = res.clone(); caches.open(VERSION).then((c) => c.put(req, copy)); }
       return res;
-    }).catch(() => (req.mode === 'navigate' ? caches.match(INDEX) : Response.error()))),
+    }).catch(() => Response.error())),
   );
 });
